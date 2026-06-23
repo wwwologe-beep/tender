@@ -169,6 +169,14 @@ export function buildCard(
     return { text, keyboard };
   }
 
+  // Победитель (bot_state сбросился в idle после вопроса, но статус остался winner)
+  if (bid?.status === 'winner') {
+    text += lang === 'ka' ? '\n🏆 თქვენ არჩეული ხართ! კლიენტი მალე დაგიკავშირდებათ.'
+      : lang === 'en' ? '\n🏆 You are selected! The client will contact you soon.'
+      : '\n🏆 Вы выбраны! Клиент скоро свяжется с вами.';
+    return { text, keyboard };
+  }
+
   // Состояние IDLE с активной ставкой
   if (bid && bid.amount > 0 && bid.status === 'pending') {
     text += `\n✅ ${lang === 'ka' ? 'თქვენი შეთავაზება' : lang === 'en' ? 'Your bid' : 'Ваша ставка'}: ${bid.amount} ₾`;

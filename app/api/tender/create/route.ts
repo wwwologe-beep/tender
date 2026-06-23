@@ -2,29 +2,26 @@ import { NextRequest, NextResponse } from 'next/server';
 import { randomUUID } from 'crypto';
 import { supabaseAdmin } from '@/lib/supabase';
 import { sendTenderToDrivers } from '@/lib/telegram/bot';
-import { analyzeOrder } from '@/lib/ai';
+import { enqueueOrderNotifications } from '@/lib/notification-queue';
+import { analyzeOrder, validateOrderCompleteness } from '@/lib/ai';
 
 interface CreateOrderBody {
-  // Универсальное описание задачи (маркетплейс)
   cargo_description?: string;
-  // Адреса — опциональны для не-транспортных заказов
   address_from?: string;
   address_to?: string;
-  // Детали
   workers_needed?: number;
   vehicles_needed?: number;
   scheduled_at?: string;
-  // Клиент
   client_name: string;
   client_phone: string;
   notes?: string;
   created_by?: string;
-  // Медиа
   media_urls?: string[];
-  // Категория и AI-поля (готово к AI-классификации)
   category?: string;
   ai_summary?: string;
   client_budget?: number | null;
+  // Признак что запрос пришёл с веб-формы со структурированными полями — пропускаем AI-валидацию
+  structured?: boolean;
 }
 
 export async function POST(req: NextRequest) {
@@ -40,6 +37,31 @@ export async function POST(req: NextRequest) {
         { error: 'Укажите описание задачи или адрес отправления' },
         { status: 400 }
       );
+    }
+
+    // AI-гейткипер: только для свободного текста (WhatsApp). Веб-форма со structured:true — пропускаем.
+    if (!body.structured && process.env.OPENROUTER_API_KEY) {
+      const rawText = [
+        body.cargo_description,
+        body.address_from && body.address_to
+          ? `Откуда: ${body.address_from}, Куда: ${body.address_to}`
+          : body.address_from ?? body.address_to,
+        body.notes,
+      ].filter(Boolean).join('. ');
+
+      const check = await validateOrderCompleteness(rawText);
+
+      if (check.status === 'incomplete') {
+        return NextResponse.json(
+          {
+            error: 'incomplete_order',
+            message: 'Для создания заказа нужно уточнить несколько деталей',
+            missing: check.missing,
+            questions: check.questions,
+          },
+          { status: 422 }
+        );
+      }
     }
 
     const { data, error } = await supabaseAdmin
@@ -104,6 +126,11 @@ export async function POST(req: NextRequest) {
     } catch (e) {
       console.error('[sendTenderToDrivers]', e);
     }
+
+    // Параллельно наполняем очередь для воркера (async-путь)
+    enqueueOrderNotifications(data.id).catch(e =>
+      console.error('[enqueueOrderNotifications]', e)
+    );
 
     const clientUrl = `https://mushebi.ge/feed/${data.token}`;
 

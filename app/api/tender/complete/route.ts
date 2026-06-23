@@ -11,7 +11,7 @@ export async function POST(req: NextRequest) {
     if (!order_id || !client_phone) {
       return NextResponse.json({ error: 'order_id и client_phone обязательны' }, { status: 400 });
     }
-    if (rating && (rating < 1 || rating > 5)) {
+    if (rating !== undefined && rating !== null && (rating < 1 || rating > 5)) {
       return NextResponse.json({ error: 'Рейтинг от 1 до 5' }, { status: 400 });
     }
 
@@ -86,21 +86,22 @@ export async function POST(req: NextRequest) {
 async function updateDriverRating(driverId: string, newRating: number, amount: number, category: string | null) {
   const { data: driver } = await supabaseAdmin
     .from('tender_drivers')
-    .select('rating, completed_orders, total_earned')
+    .select('rating_sum, rating_count, completed_orders, total_earned')
     .eq('id', driverId)
     .single();
 
   if (!driver) return;
 
-  const completed = (driver.completed_orders ?? 0) + 1;
-  const prevTotal = (driver.rating ?? 5) * (completed - 1);
-  const newAvg = Math.round(((prevTotal + newRating) / completed) * 10) / 10;
+  const newSum = (driver.rating_sum ?? 0) + newRating;
+  const newCount = (driver.rating_count ?? 0) + 1;
 
   await supabaseAdmin
     .from('tender_drivers')
     .update({
-      rating: newAvg,
-      completed_orders: completed,
+      rating_sum: newSum,
+      rating_count: newCount,
+      rating: Math.round((newSum / newCount) * 100) / 100,
+      completed_orders: (driver.completed_orders ?? 0) + 1,
       total_earned: (driver.total_earned ?? 0) + amount,
       last_completed_at: new Date().toISOString(),
     })

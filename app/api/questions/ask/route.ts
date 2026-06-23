@@ -3,6 +3,8 @@ import { supabaseAdmin } from '@/lib/supabase';
 import { translateFaqEntry } from '@/lib/ai';
 import { sendPush } from '@/lib/push';
 
+const QUESTION_LIMIT = 3;
+
 // POST /api/questions/ask
 // Body: { order_id, driver_id, question, lang }
 export async function POST(req: NextRequest) {
@@ -23,6 +25,18 @@ export async function POST(req: NextRequest) {
     if (!order) return NextResponse.json({ error: 'Заказ не найден' }, { status: 404 });
     if (!['bidding', 'selected'].includes(order.status)) {
       return NextResponse.json({ error: 'Заказ закрыт' }, { status: 400 });
+    }
+
+    // C3: лимит вопросов — не более QUESTION_LIMIT на водителя на заказ
+    const { count: questionCount } = await supabaseAdmin
+      .from('order_questions')
+      .select('id', { count: 'exact', head: true })
+      .eq('order_id', order_id)
+      .eq('driver_id', driver_id)
+      .in('status', ['pending', 'answered']);
+
+    if ((questionCount ?? 0) >= QUESTION_LIMIT) {
+      return NextResponse.json({ error: 'Превышен лимит вопросов для данного заказа' }, { status: 400 });
     }
 
     // Проверяем нет ли уже точно такого вопроса от этого исполнителя
@@ -47,7 +61,7 @@ export async function POST(req: NextRequest) {
         question_original: question.trim(),
         question_lang: lang,
         status: 'pending',
-        answered_by: 'pending',
+        answered_by: null,
       })
       .select('id')
       .single();

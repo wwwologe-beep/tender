@@ -176,6 +176,88 @@ export async function translateChatMessage(
   }
 }
 
+// ─── Гейткипер: проверка полноты заказа перед созданием ──────────────────────
+
+// Категории где маршрут обязателен (откуда → куда)
+const ROUTE_REQUIRED_CATEGORIES = ['moving', 'transport', 'courier'];
+
+export interface CompletenessCheck {
+  status: 'ok' | 'incomplete';
+  detected_lang: 'ru' | 'ka' | 'en';
+  missing: string[];
+  questions: string[];
+}
+
+export async function validateOrderCompleteness(rawText: string): Promise<CompletenessCheck> {
+  try {
+    const response = await getClient().chat.completions.create({
+      model: 'google/gemini-2.5-flash',
+      temperature: 0,
+      max_tokens: 400,
+      response_format: { type: 'json_object' },
+      messages: [
+        {
+          role: 'system',
+          content: `You are a logistics order validator for a Georgian marketplace.
+Analyze the customer's order text. Return ONLY compact JSON, no prose.
+
+Category rules:
+- LOGISTICS (moving/transport/courier): needs cargo, origin, destination, scale.
+- SERVICE (cleaning/repair/electrician etc.): needs service type, destination address, scope.
+
+Pragmatic rules:
+- "2-room apartment", "one sofa", "office of 10 people" = scale known, do NOT flag.
+- A district/street name counts as a valid address.
+- Only flag truly absent info that cannot be inferred.
+- Single word with no location (e.g. "container", "move things") = incomplete.
+
+Return this JSON (keep questions short, max 10 words each, in customer's language):
+{"detected_lang":"ru|ka|en","missing":[],"questions":[]}`,
+        },
+        { role: 'user', content: rawText },
+      ],
+    });
+
+    const content = response.choices[0]?.message?.content;
+    if (!content) return { status: 'ok', detected_lang: 'ru', missing: [], questions: [] };
+
+    // Gemini иногда обрезает JSON на длинных кириллических строках — парсим безопасно
+    let safeContent = content.trim();
+    if (!safeContent.endsWith('}')) {
+      // Обрезаем до последней завершённой строки массива или поля
+      const lastBrace = safeContent.lastIndexOf('}');
+      const lastBracket = safeContent.lastIndexOf(']');
+      if (lastBracket > lastBrace) {
+        // Незакрытый массив — закрываем его и объект
+        safeContent = safeContent.slice(0, lastBracket + 1) + '}';
+      } else if (lastBrace > 0) {
+        safeContent = safeContent.slice(0, lastBrace + 1);
+      }
+    }
+
+    const parsed = JSON.parse(safeContent) as {
+      detected_lang: 'ru' | 'ka' | 'en';
+      category_type: string;
+      missing: string[];
+      questions: string[];
+    };
+
+    const missing = parsed.missing ?? [];
+    const questions = parsed.questions ?? [];
+
+    return {
+      status: missing.length > 0 ? 'incomplete' : 'ok',
+      detected_lang: parsed.detected_lang ?? 'ru',
+      missing,
+      questions,
+    };
+  } catch (err) {
+    console.error('[ai.validateOrderCompleteness]', err);
+    // При ошибке AI — пропускаем заказ, не блокируем клиента
+    return { status: 'ok', detected_lang: 'ru', missing: [], questions: [] };
+  }
+}
+
 // ─── Генерация WhatsApp-шаблона ───────────────────────────────────────────────
 
 export async function generateWhatsAppGreeting(

@@ -21,12 +21,13 @@ export async function POST(req: NextRequest) {
     if (orderError || !order) {
       return NextResponse.json({ error: 'Заказ не найден' }, { status: 404 });
     }
+
+    // Идемпотентность: если эта же ставка уже победила — вернуть ok
     if (order.status === 'selected') {
-      // Идемпотентность: если эта же ставка уже победила — вернуть ok
       const { data: existingWin } = await supabaseAdmin
         .from('tender_bids').select('id').eq('id', bid_id).eq('status', 'winner').single();
       if (existingWin) return NextResponse.json({ ok: true });
-      return NextResponse.json({ error: 'Исполнитель уже выбран' }, { status: 400 });
+      return NextResponse.json({ error: 'Исполнитель уже выбран' }, { status: 409 });
     }
     if (order.status !== 'bidding') {
       return NextResponse.json({ error: 'Тендер закрыт' }, { status: 400 });
@@ -44,16 +45,21 @@ export async function POST(req: NextRequest) {
 
     const resolvedOrderId = order.id;
 
-    // Атомарное закрытие тендера
-    await supabaseAdmin.from('tender_bids').update({ status: 'winner', bot_state: 'winner' }).eq('id', bid_id);
-    await supabaseAdmin.from('tender_bids')
-      .update({ status: 'lost', bot_state: 'closed' })
-      .eq('order_id', resolvedOrderId).neq('id', bid_id).eq('status', 'pending');
-    await supabaseAdmin.from('tender_orders').update({
-      status: 'selected',
-      winning_bid_id: bid_id,
-      executor_id: winBid.driver_id,
-    }).eq('id', resolvedOrderId).eq('status', 'bidding');
+    // Атомарное закрытие тендера через RPC — защита от race condition
+    const { data: accepted, error: rpcError } = await supabaseAdmin
+      .rpc('accept_bid_atomic', { p_order_id: resolvedOrderId, p_bid_id: bid_id });
+
+    if (rpcError) {
+      console.error('[accept-bid] rpc error:', rpcError);
+      return NextResponse.json({ error: 'Ошибка базы данных' }, { status: 500 });
+    }
+    if (!accepted) {
+      // RPC вернул false — другой запрос успел раньше (race condition)
+      return NextResponse.json(
+        { error: 'Исполнитель уже был выбран другим запросом', code: 'race_condition' },
+        { status: 409 }
+      );
+    }
 
     // Запоминаем активный заказ у победителя
     await supabaseAdmin.from('tender_drivers')
@@ -136,10 +142,17 @@ export async function POST(req: NextRequest) {
             ka: '📅 შეხვედრის დრო',
             en: '📅 Set meeting time',
           };
+          const askLabel: Record<string, string> = {
+            ru: '❓ Задать вопрос клиенту',
+            ka: '❓ კითხვა კლიენტს',
+            en: '❓ Ask client a question',
+          };
           const actionKeyboard = new InlineKeyboard()
             .text(meetingLabel[lang] ?? meetingLabel.ru, `set_meeting:${resolvedOrderId}`)
             .row()
             .text(btn.chat, `msg_client:${resolvedOrderId}`)
+            .row()
+            .text(askLabel[lang] ?? askLabel.ru, `ask_question:${resolvedOrderId}`)
             .row()
             .text(contactLabel[lang] ?? contactLabel.ru, `request_contact:${resolvedOrderId}`)
             .row()

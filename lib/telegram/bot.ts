@@ -3,6 +3,7 @@ import { supabaseAdmin } from '@/lib/supabase';
 import { chatWithAdvisor } from '@/lib/ai-advisor';
 import { translateChatMessage } from '@/lib/ai';
 import { buildCard, refreshCard, type CardOrder, type CardDriver, type CardBid } from '@/lib/telegram/card';
+import { TARIFF_PLANS, type TariffPlanId } from '@/lib/types';
 
 export const bot = new Bot(process.env.TELEGRAM_BOT_TOKEN!);
 
@@ -37,32 +38,61 @@ bot.command('start', async (ctx) => {
 
   const { data: existing } = await supabaseAdmin
     .from('tender_drivers')
-    .select('id, name, status, reg_state')
+    .select('id, name, status, driver_language, reg_state, subscription_expires_at')
     .eq('telegram_id', telegramId)
     .single();
 
+  // Уже зарегистрирован и не в процессе регистрации
   if (existing && !existing.reg_state) {
-    const statusText =
-      existing.status === 'active'
-        ? '✅ Вы активны и получаете заказы.'
-        : '⏳ Ваш аккаунт ожидает подтверждения администратора.';
-    await ctx.reply(`${existing.name}, вы уже зарегистрированы.\n\n${statusText}`);
+    const lang = (existing.driver_language as string) ?? 'ru';
+    const expiresAt = existing.subscription_expires_at as string | null;
+    const isActive  = expiresAt && new Date(expiresAt) > new Date();
+
+    const statusMsgs: Record<string, string> = {
+      ru: existing.status === 'active'
+        ? (isActive
+          ? `✅ ${existing.name}, вы активны и получаете заказы.\n\nПодписка действует до: ${new Date(expiresAt!).toLocaleDateString('ru-RU')}`
+          : `⚠️ ${existing.name}, аккаунт активен, но подписка истекла.\n\nДля получения заказов продлите подписку: /topup`)
+        : `⏳ ${existing.name}, ваш аккаунт ожидает подтверждения администратора.`,
+      ka: existing.status === 'active'
+        ? (isActive
+          ? `✅ ${existing.name}, თქვენ აქტიური ხართ და იღებთ შეკვეთებს.\n\nგამოწერა მოქმედებს: ${new Date(expiresAt!).toLocaleDateString('ka-GE')}-მდე`
+          : `⚠️ ${existing.name}, ანგარიში აქტიურია, მაგრამ გამოწერა ამოიწურა.\n\nშეკვეთების მისაღებად განაახლეთ: /topup`)
+        : `⏳ ${existing.name}, თქვენი ანგარიში ელოდება ადმინისტრატორის დადასტურებას.`,
+      en: existing.status === 'active'
+        ? (isActive
+          ? `✅ ${existing.name}, you are active and receiving orders.\n\nSubscription active until: ${new Date(expiresAt!).toLocaleDateString('en-GB')}`
+          : `⚠️ ${existing.name}, account is active but subscription expired.\n\nRenew to receive orders: /topup`)
+        : `⏳ ${existing.name}, your account is pending admin confirmation.`,
+    };
+    await ctx.reply(statusMsgs[lang] ?? statusMsgs.ru);
     return;
   }
 
-  // Reset reg_state and start fresh
+  // Создаём или сбрасываем запись — первый шаг теперь выбор языка
   if (existing) {
-    await supabaseAdmin.from('tender_drivers').update({ reg_state: { step: 'name' } }).eq('id', existing.id);
+    await supabaseAdmin.from('tender_drivers')
+      .update({ reg_state: { step: 'lang' } })
+      .eq('id', existing.id);
   } else {
-    // Will be created at reg_spec step — just store state in a temp record
     await supabaseAdmin.from('tender_drivers').upsert(
-      { telegram_id: telegramId, reg_state: { step: 'name' }, status: 'registering', name: '', phone: '' },
+      { telegram_id: telegramId, reg_state: { step: 'lang' }, status: 'registering', name: '', phone: '' },
       { onConflict: 'telegram_id' }
     );
   }
 
+  // Определяем язык устройства пользователя для подсветки
+  const userLangCode = ctx.from?.language_code ?? '';
+  const suggestedLang = userLangCode.startsWith('ka') ? 'ka' : userLangCode.startsWith('en') ? 'en' : 'ru';
+
+  const langKeyboard = new InlineKeyboard()
+    .text(suggestedLang === 'ka' ? '✅ 🇬🇪 ქართული' : '🇬🇪 ქართული', 'reg_lang:ka').row()
+    .text(suggestedLang === 'ru' ? '✅ 🇷🇺 Русский'  : '🇷🇺 Русский',  'reg_lang:ru').row()
+    .text(suggestedLang === 'en' ? '✅ 🇬🇧 English'  : '🇬🇧 English',  'reg_lang:en');
+
   await ctx.reply(
-    '👋 Добро пожаловать в mushebi.ge!\n\nЭто бот для исполнителей — грузчиков, водителей и мастеров.\n\nДля начала введите ваше имя и фамилию:'
+    '👋 Добро пожаловать в mushebi.ge!\n\n🌐 Выберите язык интерфейса:\nაირჩიეთ ენა:\nChoose language:',
+    { reply_markup: langKeyboard }
   );
 });
 
@@ -82,43 +112,68 @@ bot.on('message:text', async (ctx) => {
 
   // ─── Шаги регистрации (reg_state в БД) ───────────────────────────────────
   const regState = driver.reg_state as Record<string, string> | null;
-  if (regState?.step === 'name' || regState?.step === 'phone') {
-    const state = regState;
 
-    if (state.step === 'name') {
-      if (text.length < 2) {
-        await ctx.reply('Введите настоящее имя (минимум 2 символа):');
-        return;
-      }
-      await supabaseAdmin.from('tender_drivers').update({
-        reg_state: { step: 'phone', name: text },
-        name: text,
-      }).eq('id', driver.id);
-      await ctx.reply('Введите номер телефона или нажмите кнопку ниже:', {
-        reply_markup: {
-          keyboard: [[{ text: '📱 Поделиться контактом', request_contact: true }]],
-          resize_keyboard: true,
-          one_time_keyboard: true,
-        },
-      });
+  if (regState?.step === 'lang' || regState?.step === 'spec') {
+    // Эти шаги — только инлайн-кнопки
+    const btnMsgs: Record<string, string> = {
+      ru: 'Пожалуйста, нажмите одну из кнопок ниже 👇',
+      ka: 'გთხოვთ, დააჭიროთ ქვემოთ მოცემულ ღილაკს 👇',
+      en: 'Please use the buttons below 👇',
+    };
+    const btnLang = regState.lang ?? 'ru';
+    await ctx.reply(btnMsgs[btnLang] ?? btnMsgs.ru);
+    return;
+  }
+
+  if (regState?.step === 'name') {
+    const btnLang = regState.lang ?? 'ru';
+    const nameValid = /^[\p{L}\s]{2,50}$/u.test(text);
+    if (!nameValid) {
+      const errMsgs: Record<string, string> = {
+        ru: 'Введите имя и фамилию (только буквы, 2–50 символов).\nПример: Георгий Иванов',
+        ka: 'შეიყვანეთ სახელი და გვარი (მხოლოდ ასოები, 2–50 სიმბოლო).\nმაგ: გიორგი ივანოვი',
+        en: 'Enter first and last name (letters only, 2–50 chars).\nExample: George Johnson',
+      };
+      await ctx.reply(errMsgs[btnLang] ?? errMsgs.ru);
       return;
     }
+    await supabaseAdmin.from('tender_drivers').update({
+      reg_state: { step: 'phone', lang: btnLang, name: text },
+      name: text,
+    }).eq('id', driver.id);
 
-    if (state.step === 'phone') {
-      const normalized = normalizePhone(text);
-      if (!normalized) {
-        await ctx.reply('Неверный формат. Попробуйте ещё раз или нажмите кнопку ниже.', {
-          reply_markup: {
-            keyboard: [[{ text: '📱 Поделиться контактом', request_contact: true }]],
-            resize_keyboard: true,
-            one_time_keyboard: true,
-          },
-        });
-        return;
-      }
-      await proceedWithPhone(ctx, driver.id, state, normalized);
-      return;
-    }
+    const phoneMsgs: Record<string, string> = {
+      ru: `✅ Отлично, ${text}!\n\nТеперь поделитесь номером телефона — нажмите кнопку ниже:`,
+      ka: `✅ მშვენიერია, ${text}!\n\nახლა გაუზიარეთ ტელეფონის ნომერი — დააჭირეთ ქვემოთ:`,
+      en: `✅ Great, ${text}!\n\nNow share your phone number — tap the button below:`,
+    };
+    const shareBtn: Record<string, string> = { ru: '📱 Поделиться номером', ka: '📱 ნომრის გაზიარება', en: '📱 Share phone number' };
+    await ctx.reply(phoneMsgs[btnLang] ?? phoneMsgs.ru, {
+      reply_markup: {
+        keyboard: [[{ text: shareBtn[btnLang] ?? shareBtn.ru, request_contact: true }]],
+        resize_keyboard: true,
+        one_time_keyboard: true,
+      },
+    });
+    return;
+  }
+
+  if (regState?.step === 'phone') {
+    // Водитель ввёл текст вместо нажатия кнопки — отклоняем, просим использовать кнопку
+    const btnLang = regState.lang ?? 'ru';
+    const errMsgs: Record<string, string> = {
+      ru: '❗ Пожалуйста, используйте кнопку «📱 Поделиться номером» для передачи контакта.\n\nЭто защищает вас от ввода неверного номера.',
+      ka: '❗ გთხოვთ გამოიყენოთ «📱 ნომრის გაზიარება» ღილაკი.\n\nეს იცავს არასწორი ნომრის შეყვანისგან.',
+      en: '❗ Please use the «📱 Share phone number» button to share your contact.\n\nThis prevents entering an incorrect number.',
+    };
+    const shareBtn: Record<string, string> = { ru: '📱 Поделиться номером', ka: '📱 ნომრის გაზიარება', en: '📱 Share phone number' };
+    await ctx.reply(errMsgs[btnLang] ?? errMsgs.ru, {
+      reply_markup: {
+        keyboard: [[{ text: shareBtn[btnLang] ?? shareBtn.ru, request_contact: true }]],
+        resize_keyboard: true,
+        one_time_keyboard: true,
+      },
+    });
     return;
   }
 
@@ -388,7 +443,13 @@ bot.on('message:contact', async (ctx) => {
   const raw = ctx.message.contact.phone_number.replace(/\s+/g, '');
   const normalized = normalizePhone(raw);
   if (!normalized) {
-    await ctx.reply('Не удалось распознать номер. Введите вручную в формате +995XXXXXXXXX');
+    const lang = state.lang ?? 'ru';
+    const errMsgs: Record<string, string> = {
+      ru: '❌ Не удалось распознать номер. Попробуйте ещё раз.',
+      ka: '❌ ნომრის ამოცნობა ვერ მოხდა. სცადეთ ისევ.',
+      en: '❌ Could not parse number. Please try again.',
+    };
+    await ctx.reply(errMsgs[lang] ?? errMsgs.ru);
     return;
   }
 
@@ -404,6 +465,8 @@ function normalizePhone(raw: string): string | null {
 }
 
 async function proceedWithPhone(ctx: Context, driverId: string, state: Record<string, string>, phone: string) {
+  const lang = state.lang ?? 'ru';
+
   const { data: byPhone } = await supabaseAdmin
     .from('tender_drivers')
     .select('id')
@@ -412,33 +475,37 @@ async function proceedWithPhone(ctx: Context, driverId: string, state: Record<st
     .single();
 
   if (byPhone) {
-    await ctx.reply('Этот номер уже зарегистрирован. Обратитесь к администратору.', {
-      reply_markup: { remove_keyboard: true },
-    });
-    await supabaseAdmin.from('tender_drivers').update({ reg_state: null }).eq('id', driverId);
+    const dupMsgs: Record<string, string> = {
+      ru: 'Этот номер уже зарегистрирован.\n\nЕсли это ваш — обратитесь к администратору.\nИначе введите /start и укажите другой номер.',
+      ka: 'ეს ნომერი უკვე დარეგისტრირებულია.\n\nთუ ეს თქვენია — დაუკავშირდით ადმინისტრატორს.\nსხვაგვარად შეიყვანეთ /start და მიუთითეთ სხვა ნომერი.',
+      en: 'This number is already registered.\n\nIf it\'s yours — contact the administrator.\nOtherwise type /start and use a different number.',
+    };
+    await ctx.reply(dupMsgs[lang] ?? dupMsgs.ru, { reply_markup: { remove_keyboard: true } });
+    await supabaseAdmin.from('tender_drivers').delete().eq('id', driverId).eq('status', 'registering');
     return;
   }
 
   await supabaseAdmin.from('tender_drivers').update({
-    reg_state: { step: 'lang', name: state.name, phone },
+    reg_state: { step: 'spec', lang, name: state.name, phone },
     phone,
   }).eq('id', driverId);
 
-  await ctx.reply('✅ Номер принят!', { reply_markup: { remove_keyboard: true } });
-
-  const langKeyboard = new InlineKeyboard()
-    .text('🇬🇪 ქართული', 'reg_lang:ka')
-    .text('🇷🇺 Русский', 'reg_lang:ru')
-    .text('🇬🇧 English', 'reg_lang:en');
-
-  await ctx.reply('Выберите язык / აირჩიეთ ენა / Choose language:', { reply_markup: langKeyboard });
+  const acceptMsgs: Record<string, string> = {
+    ru: '✅ Номер принят! Теперь выберите вашу специализацию:',
+    ka: '✅ ნომერი მიღებულია! ახლა აირჩიეთ თქვენი სპეციალიზაცია:',
+    en: '✅ Phone accepted! Now choose your specialization:',
+  };
+  await ctx.reply(acceptMsgs[lang] ?? acceptMsgs.ru, {
+    reply_markup: { remove_keyboard: true },
+  });
+  await ctx.reply('👇', { reply_markup: buildSpecKeyboard(lang) });
 }
 
-// ─── Callback: выбор языка → выбор специализации ─────────────────────────────
+// ─── Callback: выбор языка → запрос имени ────────────────────────────────────
 
 bot.callbackQuery(/^reg_lang:(.+)$/, async (ctx) => {
   const telegramId = ctx.from!.id;
-  const lang = ctx.match[1];
+  const lang = ctx.match[1] as 'ru' | 'ka' | 'en';
 
   const { data: driver } = await supabaseAdmin
     .from('tender_drivers')
@@ -451,23 +518,36 @@ bot.callbackQuery(/^reg_lang:(.+)$/, async (ctx) => {
     return;
   }
 
-  const state = driver.reg_state as Record<string, string>;
   await supabaseAdmin.from('tender_drivers').update({
-    reg_state: { step: 'spec', name: state.name, phone: state.phone, lang },
+    reg_state: { step: 'name', lang },
     driver_language: lang,
   }).eq('id', driver.id);
 
   await ctx.answerCallbackQuery();
 
-  const keyboard = new InlineKeyboard()
-    .text('🚛 Грузчик', 'reg_spec:mover')
-    .row()
-    .text('🚐 Водитель', 'reg_spec:driver')
-    .row()
-    .text('🔧 Разнорабочий', 'reg_spec:handyman');
-
-  await ctx.editMessageText('Выберите вашу специализацию:', { reply_markup: keyboard });
+  const nameMsgs: Record<string, string> = {
+    ru: '✅ Язык выбран: Русский\n\nВведите ваше имя и фамилию:',
+    ka: '✅ ენა არჩეულია: ქართული\n\nშეიყვანეთ თქვენი სახელი და გვარი:',
+    en: '✅ Language selected: English\n\nEnter your first and last name:',
+  };
+  await ctx.editMessageText(nameMsgs[lang] ?? nameMsgs.ru);
 });
+
+// ─── Callback: промежуточный — reg_lang на шаге spec (показ специализаций) ────
+// Triggered AFTER phone is confirmed — driver.reg_state.step === 'spec'
+
+function buildSpecKeyboard(lang: string): InlineKeyboard {
+  const labels: Record<string, Record<string, string>> = {
+    ru: { mover: '🚛 Грузчик / переезды', driver: '🚐 Водитель / доставка', handyman: '🔧 Разнорабочий / мастер' },
+    ka: { mover: '🚛 მეამბოხე / გადასვლები', driver: '🚐 მძღოლი / მიწოდება', handyman: '🔧 სამუშაო კაცი / ოსტატი' },
+    en: { mover: '🚛 Mover / relocation', driver: '🚐 Driver / delivery', handyman: '🔧 Handyman / repairs' },
+  };
+  const l = labels[lang] ?? labels.ru;
+  return new InlineKeyboard()
+    .text(l.mover,    'reg_spec:mover').row()
+    .text(l.driver,   'reg_spec:driver').row()
+    .text(l.handyman, 'reg_spec:handyman');
+}
 
 // ─── Callback: выбор специализации → запись в БД ─────────────────────────────
 
@@ -493,15 +573,15 @@ bot.callbackQuery(/^reg_spec:(.+)$/, async (ctx) => {
   }
 
   await ctx.answerCallbackQuery();
-  await ctx.editMessageText('⏳ Сохраняем данные...');
+  await ctx.editMessageText('⏳...');
 
   const { error } = await supabaseAdmin.from('tender_drivers').update({
-    name: state.name,
-    phone: state.phone,
+    name:            state.name,
+    phone:           state.phone,
     driver_language: state.lang,
-    specialization: spec,
-    status: 'pending',
-    reg_state: null,
+    specialization:  spec,
+    status:          'pending',
+    reg_state:       null,
   }).eq('id', driver.id);
 
   if (error) {
@@ -509,24 +589,28 @@ bot.callbackQuery(/^reg_spec:(.+)$/, async (ctx) => {
     return;
   }
 
-  await ctx.editMessageText(
-    `✅ ${state.name}, вы зарегистрированы!\n\n` +
-    `⏳ Ваша заявка отправлена администратору. После подтверждения вы начнёте получать заказы.\n\n` +
-    `📞 Телефон: ${state.phone}`
-  );
+  const lang = state.lang;
+  const doneMsgs: Record<string, string> = {
+    ru: `✅ ${state.name}, заявка отправлена!\n\n⏳ Администратор проверит данные и активирует аккаунт в течение нескольких часов.\n\nПосле активации вы получите сообщение с инструкцией по оплате подписки.`,
+    ka: `✅ ${state.name}, განაცხადი გაიგზავნა!\n\n⏳ ადმინისტრატორი შეამოწმებს მონაცემებს და გააქტიურებს ანგარიშს რამდენიმე საათში.\n\nგააქტიურების შემდეგ მიიღებთ გამოწერის გადახდის ინსტრუქციას.`,
+    en: `✅ ${state.name}, application sent!\n\n⏳ Admin will review your details and activate your account within a few hours.\n\nAfter activation you will receive subscription payment instructions.`,
+  };
+  await ctx.editMessageText(doneMsgs[lang] ?? doneMsgs.ru);
 
   if (ADMIN_TELEGRAM_ID) {
     const specLabels: Record<string, string> = {
       mover: '🚛 Грузчик', driver: '🚐 Водитель', handyman: '🔧 Разнорабочий',
     };
     const adminKeyboard = new InlineKeyboard()
-      .text('✅ Подтвердить', `admin_approve:${state.phone}`)
-      .text('❌ Отклонить', `admin_reject:${state.phone}`);
+      .text('✅ Активировать',          `admin_approve:${state.phone}`).row()
+      .text('🎁 Одобрить + 7 дней триала', `approve_with_trial:${driver.id}`).row()
+      .text('❌ Отклонить',             `admin_reject:${state.phone}`);
 
     await bot.api.sendMessage(
       ADMIN_TELEGRAM_ID,
       `🆕 Новый исполнитель ожидает подтверждения\n\n` +
-      `👤 Имя: ${state.name}\n📞 Телефон: ${state.phone}\n💼 Специализация: ${specLabels[spec] ?? spec}\n🌐 Язык: ${state.lang}`,
+      `👤 Имя: ${state.name}\n📞 Телефон: ${state.phone}\n` +
+      `💼 Специализация: ${specLabels[spec] ?? spec}\n🌐 Язык: ${lang}`,
       { reply_markup: adminKeyboard }
     );
   }
@@ -546,7 +630,7 @@ bot.callbackQuery(/^admin_approve:(.+)$/, async (ctx) => {
     .update({ status: 'active' })
     .eq('phone', phone)
     .eq('status', 'pending')
-    .select('id, name, telegram_id')
+    .select('id, name, telegram_id, driver_language')
     .single();
 
   if (error || !driver) {
@@ -554,13 +638,85 @@ bot.callbackQuery(/^admin_approve:(.+)$/, async (ctx) => {
     return;
   }
 
-  await ctx.answerCallbackQuery({ text: `✅ ${driver.name} подтверждён!` });
-  await ctx.editMessageText((ctx.callbackQuery.message?.text ?? '') + `\n\n✅ Подтверждён`);
+  await ctx.answerCallbackQuery({ text: `✅ ${driver.name} активирован!` });
+  await ctx.editMessageText((ctx.callbackQuery.message?.text ?? '') + `\n\n✅ Активирован`);
 
   if (driver.telegram_id) {
+    const lang = (driver.driver_language as string) ?? 'ru';
+    const code = `MUSH-${driver.id.slice(0, 5).toUpperCase()}`;
+
+    // Шаг 1: поздравление с активацией
+    const welcomeMsgs: Record<string, string> = {
+      ru: `🎉 ${driver.name}, ваш аккаунт активирован!\n\nЧтобы начать получать заказы в Тбилиси и Батуми, подключите безлимитный недельный тариф — всего 30 ₾/неделю.`,
+      ka: `🎉 ${driver.name}, თქვენი ანგარიში გააქტიურდა!\n\nთბილისსა და ბათუმში შეკვეთების მიღების დასაწყებად დაუკავშირდით ულიმიტო კვირის ტარიფს — მხოლოდ 30 ₾/კვირაში.`,
+      en: `🎉 ${driver.name}, your account has been activated!\n\nTo start receiving orders in Tbilisi and Batumi, activate the unlimited weekly plan — just 30 ₾/week.`,
+    };
+    await bot.api.sendMessage(driver.telegram_id, welcomeMsgs[lang] ?? welcomeMsgs.ru);
+
+    // Шаг 2: инструкция по оплате (та же логика что и /topup)
+    const tariffList = TARIFF_PLANS.map(p => `• ${p.label} — ${p.price} ₾`).join('\n');
+    const payMsgs: Record<string, string> = {
+      ru: `💳 *Тарифы:*\n${tariffList}\n\n*Реквизиты для перевода:*\nIBAN: \`${PAYMENT_DETAILS}\`\n\n⚠️ Обязательно укажите код:\n*${code}*\n\nПосле оплаты отправьте скриншот чека в этот чат — оператор активирует подписку вручную.`,
+      ka: `💳 *ტარიფები:*\n${tariffList}\n\n*გადახდის რეკვიზიტები:*\nIBAN: \`${PAYMENT_DETAILS}\`\n\n⚠️ აუცილებლად მიუთითეთ კოდი:\n*${code}*\n\nგადახდის შემდეგ გამოაგზავნეთ ქვითრის სკრინშოტი ამ ჩატში — ოპერატორი ხელით გააქტიურებს გამოწერას.`,
+      en: `💳 *Plans:*\n${tariffList}\n\n*Payment details:*\nIBAN: \`${PAYMENT_DETAILS}\`\n\n⚠️ Include transfer code:\n*${code}*\n\nAfter payment, send a screenshot of the receipt here — operator will activate your subscription.`,
+    };
+    await bot.api.sendMessage(driver.telegram_id, payMsgs[lang] ?? payMsgs.ru, { parse_mode: 'Markdown' });
+  }
+});
+
+bot.callbackQuery(/^approve_with_trial:(.+)$/, async (ctx) => {
+  if (ADMIN_TELEGRAM_ID && ctx.from!.id !== ADMIN_TELEGRAM_ID) {
+    await ctx.answerCallbackQuery({ text: '⛔ Нет прав' });
+    return;
+  }
+
+  const driverId = ctx.match[1];
+  const { data: driver, error } = await supabaseAdmin
+    .from('tender_drivers')
+    .update({ status: 'active' })
+    .eq('id', driverId)
+    .eq('status', 'pending')
+    .select('id, name, telegram_id, driver_language')
+    .single();
+
+  if (error || !driver) {
+    await ctx.answerCallbackQuery({ text: 'Не найден или уже активен', show_alert: true });
+    return;
+  }
+
+  // Начисляем 7 дней безлимитного триала через RPC
+  const { error: trialError } = await supabaseAdmin.rpc('extend_driver_subscription', {
+    p_driver_id: driver.id,
+    p_days:      7,
+  });
+
+  if (trialError) {
+    console.error('[approve_with_trial] rpc error:', trialError.message);
+    await ctx.answerCallbackQuery({
+      text: `❌ Ошибка начисления триала: ${trialError.message}. Статус активирован, триал — нет. Добавьте вручную.`,
+      show_alert: true,
+    });
+    return;
+  }
+
+  const operatorName = ctx.from!.first_name ?? 'Оператор';
+  await ctx.answerCallbackQuery({ text: `🎁 ${driver.name} — 7 дней триала!` });
+  await ctx.editMessageText(
+    (ctx.callbackQuery.message?.text ?? '') +
+    `\n\n🎁 Одобрен с 7-дневным ТРИАЛОМ оператором ${operatorName}`
+  );
+
+  if (driver.telegram_id) {
+    const lang = (driver.driver_language as string) ?? 'ru';
+    const trialMsgs: Record<string, string> = {
+      ru: `🎉 Добро пожаловать в команду, ${driver.name}!\n\nВаш аккаунт успешно активирован. Администрация предоставила вам *7 дней БЕСПЛАТНОГО тестового периода!* 🚀\n\nВы уже можете принимать заказы в Тбилиси и Батуми — заходите и зарабатывайте!\n\nПосмотреть статус аккаунта: /profile`,
+      ka: `🎉 კეთილი იყოს თქვენი მობრძანება გუნდში, ${driver.name}!\n\nთქვენი ანგარიში წარმატებით გააქტიურდა. ადმინისტრაცია გაძლევთ *7 დღიანი ᲣᲤᲐᲡᲝ საცდელი პერიოდი!* 🚀\n\nუკვე შეგიძლიათ მიიღოთ შეკვეთები თბილისსა და ბათუმში — შედით და იმუშავეთ!\n\nანგარიშის სტატუსი: /profile`,
+      en: `🎉 Welcome to the team, ${driver.name}!\n\nYour account has been successfully activated. The administration has granted you a *7-day FREE trial period!* 🚀\n\nYou can already receive orders in Tbilisi and Batumi — dive in and start earning!\n\nCheck your account status: /profile`,
+    };
     await bot.api.sendMessage(
       driver.telegram_id,
-      `✅ Ваш аккаунт подтверждён!\n\nТеперь вы будете получать новые заказы. Удачи! 🚀`
+      trialMsgs[lang] ?? trialMsgs.ru,
+      { parse_mode: 'Markdown' }
     );
   }
 });
@@ -576,14 +732,20 @@ bot.callbackQuery(/^admin_reject:(.+)$/, async (ctx) => {
     .from('tender_drivers')
     .update({ status: 'rejected' })
     .eq('phone', phone)
-    .select('id, name, telegram_id')
+    .select('id, name, telegram_id, driver_language')
     .single();
 
   await ctx.answerCallbackQuery({ text: 'Отклонено' });
   await ctx.editMessageText((ctx.callbackQuery.message?.text ?? '') + `\n\n❌ Отклонён`);
 
   if (driver?.telegram_id) {
-    await bot.api.sendMessage(driver.telegram_id, `❌ К сожалению, ваша заявка отклонена. Обратитесь к менеджеру для уточнения.`);
+    const lang = (driver.driver_language as string) ?? 'ru';
+    const rejectMsgs: Record<string, string> = {
+      ru: '❌ К сожалению, ваша заявка отклонена. Обратитесь к менеджеру для уточнения.',
+      ka: '❌ სამწუხაროდ, თქვენი განაცხადი უარყოფილია. დაუკავშირდით მენეჯერს დეტალებისთვის.',
+      en: '❌ Unfortunately, your application has been rejected. Please contact the manager for details.',
+    };
+    await bot.api.sendMessage(driver.telegram_id, rejectMsgs[lang] ?? rejectMsgs.ru);
   }
 });
 
@@ -622,6 +784,13 @@ bot.command('approve', async (ctx) => {
 
 bot.on('callback_query:data', async (ctx) => {
   const data = ctx.callbackQuery.data;
+
+  // Компактный формат из очереди уведомлений: b:<token>:<price> и a:<token>
+  if (data.startsWith('b:'))            { await handleBidByToken(ctx); return; }
+  if (data.startsWith('a:'))            { await handleAcceptBudgetByToken(ctx); return; }
+  if (data.startsWith('approve_sub:'))  { await handleApproveSubscription(ctx); return; }
+  if (data.startsWith('reject_sub:'))   { await handleRejectSubscription(ctx); return; }
+  if (data === 'topup')                 { await handleTopup(ctx); return; }
 
   if (data.startsWith('bid:'))          { await handleBid(ctx); return; }
   if (data.startsWith('withdraw:'))     { await handleWithdraw(ctx); return; }
@@ -676,6 +845,111 @@ async function handleBid(ctx: Context) {
 
   await ctx.answerCallbackQuery({ text: `Ставка ${amount} ₾ принята!` });
   if (msgId) await refreshCard(ctx.from!.id, msgId, orderId);
+}
+
+// ─── Компактный формат: b:<token>:<price> ────────────────────────────────────
+
+async function handleBidByToken(ctx: Context) {
+  const parts = ctx.callbackQuery!.data!.split(':');
+  if (parts.length < 3) { await ctx.answerCallbackQuery({ text: 'Ошибка формата', show_alert: true }); return; }
+
+  const [, orderToken, amountStr] = parts;
+  const amount = parseFloat(amountStr);
+  if (isNaN(amount) || amount <= 0) { await ctx.answerCallbackQuery({ text: 'Некорректная сумма', show_alert: true }); return; }
+
+  const { data: driver } = await supabaseAdmin
+    .from('tender_drivers')
+    .select('id, status, driver_language, subscription_expires_at')
+    .eq('telegram_id', ctx.from!.id)
+    .single();
+  if (!driver || driver.status !== 'active') {
+    await ctx.answerCallbackQuery({ text: 'Водитель не зарегистрирован', show_alert: true }); return;
+  }
+
+  const lang = (driver.driver_language as string) ?? 'ru';
+
+  const expiresAt = driver.subscription_expires_at as string | null;
+  if (!expiresAt || new Date() > new Date(expiresAt)) {
+    const noSubMsgs: Record<string, string> = {
+      ru: '❌ Ваш безлимитный тариф не активен. Пожалуйста, продлите подписку у оператора.',
+      ka: '❌ თქვენი ულიმიტო ტარიფი არ არის აქტიური. გთხოვთ, განაახლოთ გამოწერა ოპერატორთან.',
+      en: '❌ Your unlimited plan is not active. Please renew your subscription with the operator.',
+    };
+    await ctx.answerCallbackQuery({ text: noSubMsgs[lang] ?? noSubMsgs.ru, show_alert: true });
+    return;
+  }
+
+  const { data: order } = await supabaseAdmin
+    .from('tender_orders').select('id, status').eq('token', orderToken).single();
+  if (!order || order.status !== 'bidding') {
+    await ctx.answerCallbackQuery({ text: 'Тендер уже закрыт', show_alert: true }); return;
+  }
+
+  await supabaseAdmin.from('tender_bids').upsert(
+    { order_id: order.id, driver_id: driver.id, amount, status: 'pending',
+      bot_state: 'idle', bot_state_updated_at: new Date().toISOString() },
+    { onConflict: 'order_id,driver_id' }
+  );
+
+  const msgs: Record<string, string> = {
+    ru: `✅ Ставка ${amount} ₾ принята!`,
+    ka: `✅ განაცხადი ${amount} ₾ მიღებულია!`,
+    en: `✅ Bid ${amount} ₾ accepted!`,
+  };
+  await ctx.answerCallbackQuery({ text: msgs[lang] ?? msgs.ru });
+}
+
+// ─── Компактный формат: a:<token> (принять бюджет) ───────────────────────────
+
+async function handleAcceptBudgetByToken(ctx: Context) {
+  const orderToken = ctx.callbackQuery!.data!.split(':')[1];
+  if (!orderToken) { await ctx.answerCallbackQuery({ text: 'Ошибка формата', show_alert: true }); return; }
+
+  const { data: driver } = await supabaseAdmin
+    .from('tender_drivers')
+    .select('id, status, driver_language, subscription_expires_at')
+    .eq('telegram_id', ctx.from!.id)
+    .single();
+  if (!driver || driver.status !== 'active') {
+    await ctx.answerCallbackQuery({ text: 'Водитель не зарегистрирован', show_alert: true }); return;
+  }
+
+  const lang = (driver.driver_language as string) ?? 'ru';
+
+  const expiresAt = driver.subscription_expires_at as string | null;
+  if (!expiresAt || new Date() > new Date(expiresAt)) {
+    const noSubMsgs: Record<string, string> = {
+      ru: '❌ Ваш безлимитный тариф не активен. Пожалуйста, продлите подписку у оператора.',
+      ka: '❌ თქვენი ულიმიტო ტარიფი არ არის აქტიური. გთხოვთ, განაახლოთ გამოწერა ოპერატორთან.',
+      en: '❌ Your unlimited plan is not active. Please renew your subscription with the operator.',
+    };
+    await ctx.answerCallbackQuery({ text: noSubMsgs[lang] ?? noSubMsgs.ru, show_alert: true });
+    return;
+  }
+
+  const { data: order } = await supabaseAdmin
+    .from('tender_orders').select('id, status, client_budget').eq('token', orderToken).single();
+  if (!order || order.status !== 'bidding') {
+    await ctx.answerCallbackQuery({ text: 'Тендер уже закрыт', show_alert: true }); return;
+  }
+
+  const amount = order.client_budget as number;
+  if (!amount || amount <= 0) {
+    await ctx.answerCallbackQuery({ text: 'Бюджет не задан клиентом', show_alert: true }); return;
+  }
+
+  await supabaseAdmin.from('tender_bids').upsert(
+    { order_id: order.id, driver_id: driver.id, amount, status: 'pending',
+      bot_state: 'idle', bot_state_updated_at: new Date().toISOString() },
+    { onConflict: 'order_id,driver_id' }
+  );
+
+  const msgs: Record<string, string> = {
+    ru: `✅ Принят бюджет клиента: ${amount} ₾`,
+    ka: `✅ კლიენტის ბიუჯეტი: ${amount} ₾`,
+    en: `✅ Accepted client budget: ${amount} ₾`,
+  };
+  await ctx.answerCallbackQuery({ text: msgs[lang] ?? msgs.ru });
 }
 
 // ─── Отозвать ставку ──────────────────────────────────────────────────────────
@@ -765,8 +1039,22 @@ async function handleAskQuestion(ctx: Context, orderId: string) {
 
   const messageId = ctx.callbackQuery?.message?.message_id ?? null;
 
-  await supabaseAdmin.from('tender_bids').upsert(
-    {
+  // Check if bid already exists (winner bid — don't reset amount/status)
+  const { data: existingBid } = await supabaseAdmin
+    .from('tender_bids')
+    .select('id')
+    .eq('order_id', orderId)
+    .eq('driver_id', driver.id)
+    .single();
+
+  if (existingBid) {
+    await supabaseAdmin.from('tender_bids').update({
+      bot_state: 'asking',
+      bot_state_updated_at: new Date().toISOString(),
+      ...(messageId ? { telegram_message_id: messageId } : {}),
+    }).eq('id', existingBid.id);
+  } else {
+    await supabaseAdmin.from('tender_bids').insert({
       order_id: orderId,
       driver_id: driver.id,
       amount: 0,
@@ -774,9 +1062,8 @@ async function handleAskQuestion(ctx: Context, orderId: string) {
       bot_state: 'asking',
       bot_state_updated_at: new Date().toISOString(),
       telegram_message_id: messageId,
-    },
-    { onConflict: 'order_id,driver_id' }
-  );
+    });
+  }
 
   if (messageId) await refreshCard(ctx.from!.id, messageId, orderId);
 }
@@ -940,14 +1227,23 @@ async function handleRequestContact(ctx: Context, orderId: string) {
   if (order) {
     const wappiToken = process.env.WAPPI_TOKEN;
     const wappiProfile = process.env.WAPPI_PROFILE_ID;
+    console.log('[request_contact] client_phone:', order.client_phone, 'wappiToken:', !!wappiToken, 'wappiProfile:', wappiProfile);
     if (wappiToken && wappiProfile && order.client_phone) {
       const url = `https://mushebi.ge/feed/${order.token}`;
       const text = `📞 Исполнитель хочет получить ваш номер телефона для связи.\n\nНажмите кнопку "Поделиться номером" здесь: ${url}`;
-      await fetch(`https://wappi.pro/api/sync/message/send?profile_id=${wappiProfile}`, {
+      const recipient = order.client_phone.replace('+', '').replace(/\s/g, '');
+      console.log('[request_contact] sending to recipient:', recipient);
+      const wappiRes = await fetch(`https://wappi.pro/api/sync/message/send?profile_id=${wappiProfile}`, {
         method: 'POST',
         headers: { Authorization: wappiToken, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ body: text, recipient: order.client_phone.replace('+', '') }),
-      }).catch(err => console.error('[request_contact whatsapp]', err));
+        body: JSON.stringify({ body: text, recipient }),
+      }).catch(err => { console.error('[request_contact whatsapp fetch error]', err); return null; });
+      if (wappiRes) {
+        const wappiData = await wappiRes.json().catch(() => null);
+        console.log('[request_contact] wappi response:', wappiRes.status, JSON.stringify(wappiData));
+      }
+    } else {
+      console.warn('[request_contact] skipping WhatsApp — missing:', { wappiToken: !!wappiToken, wappiProfile: !!wappiProfile, client_phone: order.client_phone });
     }
     // Push уведомление клиенту
     if (order.push_subscription && order.token) {
@@ -1256,6 +1552,311 @@ const CATEGORY_TO_SPECS: Record<string, string[]> = {
   general:     ['mover', 'driver', 'handyman', 'electrician', 'plumber', 'cleaner', 'moving', 'cleaning', 'electrical', 'plumbing', 'repair'],
 };
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// ─── ФИНТЕХ: Подписки водителей ──────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const ADMIN_CHAT_ID = process.env.TELEGRAM_ADMIN_CHAT_ID
+  ? parseInt(process.env.TELEGRAM_ADMIN_CHAT_ID)
+  : ADMIN_TELEGRAM_ID; // fallback на личку админа
+
+// Реквизиты для оплаты (заглушка — заменить на реальные перед production)
+const PAYMENT_DETAILS = 'GE00TB0000000000000000'; // IBAN-заглушка
+
+// ─── /topup — запрос на пополнение ───────────────────────────────────────────
+
+bot.command('topup', async (ctx) => {
+  const telegramId = ctx.from!.id;
+
+  const { data: driver } = await supabaseAdmin
+    .from('tender_drivers')
+    .select('id, name, status, driver_language, subscription_expires_at')
+    .eq('telegram_id', telegramId)
+    .maybeSingle();
+
+  const notAllowed = !driver || driver.status === 'registering' || driver.status === 'blocked' || driver.status === 'rejected';
+  if (notAllowed) {
+    const errLang = (driver?.driver_language as string) ?? 'ru';
+    const noAccessMsgs: Record<string, string> = {
+      ru: !driver || driver.status === 'registering'
+        ? 'Вы ещё не зарегистрированы. Введите /start'
+        : '⛔ Ваш аккаунт заблокирован. Обратитесь к администратору.',
+      ka: !driver || driver.status === 'registering'
+        ? 'თქვენ ჯერ არ ხართ დარეგისტრირებული. შეიყვანეთ /start'
+        : '⛔ თქვენი ანგარიში დაბლოკილია. დაუკავშირდით ადმინისტრატორს.',
+      en: !driver || driver.status === 'registering'
+        ? 'You are not registered yet. Type /start'
+        : '⛔ Your account is blocked. Contact the administrator.',
+    };
+    await ctx.reply(noAccessMsgs[errLang] ?? noAccessMsgs.ru);
+    return;
+  }
+
+  const lang = (driver.driver_language as string) ?? 'ru';
+  const code = `MUSH-${driver.id.slice(0, 5).toUpperCase()}`;
+
+  const tariffList = TARIFF_PLANS
+    .map(p => `• ${p.label} — ${p.price} ₾`)
+    .join('\n');
+
+  const expiresAt = driver.subscription_expires_at as string | null;
+  const subStatus = expiresAt && new Date(expiresAt) > new Date()
+    ? `✅ Активна до: ${new Date(expiresAt).toLocaleDateString('ru-RU')}`
+    : '❌ Не активна';
+
+  const msgs: Record<string, string> = {
+    ru: `💳 *Пополнение подписки*\n\nСтатус: ${subStatus}\n\n*Тарифы:*\n${tariffList}\n\n*Реквизиты для перевода:*\nIBAN: \`${PAYMENT_DETAILS}\`\n\n⚠️ Обязательно укажите код перевода:\n*${code}*\n\nПосле оплаты отправьте скриншот чека прямо сюда — оператор активирует подписку вручную.`,
+    ka: `💳 *გამოწერის შევსება*\n\nსტატუსი: ${subStatus}\n\n*ტარიფები:*\n${tariffList}\n\n*გადარიცხვის რეკვიზიტები:*\nIBAN: \`${PAYMENT_DETAILS}\`\n\n⚠️ აუცილებლად მიუთითეთ კოდი:\n*${code}*\n\nგადახდის შემდეგ გამოგზავნეთ ქვითრის სკრინშოტი — ოპერატორი გააქტიურებს გამოწერას.`,
+    en: `💳 *Subscription Top-Up*\n\nStatus: ${subStatus}\n\n*Plans:*\n${tariffList}\n\n*Payment details:*\nIBAN: \`${PAYMENT_DETAILS}\`\n\n⚠️ Include transfer code:\n*${code}*\n\nAfter payment, send a screenshot of the receipt here — operator will activate your subscription.`,
+  };
+
+  // Сохраняем состояние ожидания чека в reg_state
+  const { data: cur } = await supabaseAdmin
+    .from('tender_drivers').select('reg_state').eq('id', driver.id).single();
+  const regState = ((cur?.reg_state ?? {}) as Record<string, unknown>);
+  regState.awaiting_receipt = true;
+  await supabaseAdmin.from('tender_drivers')
+    .update({ reg_state: regState })
+    .eq('id', driver.id);
+
+  await ctx.reply(msgs[lang] ?? msgs.ru, { parse_mode: 'Markdown' });
+});
+
+// Инлайн-кнопка "Пополнить" с тем же эффектом что и /topup
+async function handleTopup(ctx: Context) {
+  await ctx.answerCallbackQuery();
+  // Имитируем текстовую команду — вызываем логику через message
+  await bot.api.sendMessage(ctx.from!.id, '/topup');
+}
+
+// ─── /profile — статус аккаунта и подписки ───────────────────────────────────
+
+bot.command('profile', async (ctx) => {
+  const telegramId = ctx.from!.id;
+
+  const { data: driver } = await supabaseAdmin
+    .from('tender_drivers')
+    .select('id, name, status, driver_language, subscription_expires_at, rating, completed_orders, total_earned')
+    .eq('telegram_id', telegramId)
+    .maybeSingle();
+
+  if (!driver || driver.status === 'registering') {
+    const errLang = (driver?.driver_language as string) ?? 'ru';
+    const noRegMsgs: Record<string, string> = {
+      ru: 'Вы ещё не зарегистрированы. Введите /start',
+      ka: 'თქვენ ჯერ არ ხართ დარეგისტრირებული. შეიყვანეთ /start',
+      en: 'You are not registered yet. Type /start',
+    };
+    await ctx.reply(noRegMsgs[errLang] ?? noRegMsgs.ru);
+    return;
+  }
+
+  const lang = (driver.driver_language as string) ?? 'ru';
+  const expiresAt = driver.subscription_expires_at as string | null;
+  const isActive  = expiresAt && new Date(expiresAt) > new Date();
+  const expDate   = isActive ? new Date(expiresAt!).toLocaleDateString(lang === 'ka' ? 'ka-GE' : lang === 'en' ? 'en-GB' : 'ru-RU') : null;
+
+  const msgs: Record<string, string> = {
+    ru: isActive
+      ? `👤 *Мой профиль*\n\nТип аккаунта: Безлимитный 🚀\nДействует до: ${expDate}\n\n⭐ Рейтинг: ${driver.rating.toFixed(1)}\n✅ Выполнено заказов: ${driver.completed_orders}\n💰 Заработано всего: ${driver.total_earned} ₾`
+      : `👤 *Мой профиль*\n\nТип аккаунта: Не активен ❌\nДля получения заказов продлите подписку: /topup\n\n⭐ Рейтинг: ${driver.rating.toFixed(1)}\n✅ Выполнено заказов: ${driver.completed_orders}`,
+    ka: isActive
+      ? `👤 *ჩემი პროფილი*\n\nანგარიშის ტიპი: ულიმიტო 🚀\nმოქმედებს: ${expDate}-მდე\n\n⭐ რეიტინგი: ${driver.rating.toFixed(1)}\n✅ დასრულებული შეკვეთები: ${driver.completed_orders}\n💰 სულ გამომუშავებული: ${driver.total_earned} ₾`
+      : `👤 *ჩემი პროფილი*\n\nანგარიშის ტიპი: არ არის აქტიური ❌\nშეკვეთების მისაღებად განაახლეთ გამოწერა: /topup\n\n⭐ რეიტინგი: ${driver.rating.toFixed(1)}\n✅ დასრულებული შეკვეთები: ${driver.completed_orders}`,
+    en: isActive
+      ? `👤 *My Profile*\n\nAccount type: Unlimited 🚀\nActive until: ${expDate}\n\n⭐ Rating: ${driver.rating.toFixed(1)}\n✅ Completed orders: ${driver.completed_orders}\n💰 Total earned: ${driver.total_earned} ₾`
+      : `👤 *My Profile*\n\nAccount type: Not active ❌\nTo receive orders, renew your subscription: /topup\n\n⭐ Rating: ${driver.rating.toFixed(1)}\n✅ Completed orders: ${driver.completed_orders}`,
+  };
+
+  await ctx.reply(msgs[lang] ?? msgs.ru, { parse_mode: 'Markdown' });
+});
+
+// ─── Приём фото-чека от водителя ─────────────────────────────────────────────
+
+bot.on('message:photo', async (ctx) => {
+  const telegramId = ctx.from!.id;
+
+  const { data: driver } = await supabaseAdmin
+    .from('tender_drivers')
+    .select('id, name, status, driver_language, reg_state')
+    .eq('telegram_id', telegramId)
+    .maybeSingle();
+
+  if (!driver) return;
+  if (driver.status === 'blocked' || driver.status === 'rejected') return;
+
+  // Реагируем только если водитель в режиме ожидания чека
+  const regState = (driver.reg_state ?? {}) as Record<string, unknown>;
+  if (!regState.awaiting_receipt) return;
+
+  const lang = (driver.driver_language as string) ?? 'ru';
+  const code = `MUSH-${driver.id.slice(0, 5).toUpperCase()}`;
+
+  // Строим инлайн-клавиатуру из TARIFF_PLANS
+  const keyboard = new InlineKeyboard();
+  for (const plan of TARIFF_PLANS) {
+    keyboard.text(
+      `✅ ${plan.label} (${plan.price} ₾)`,
+      `approve_sub:${driver.id}:${plan.id}`
+    ).row();
+  }
+  keyboard.text('❌ Отклонить', `reject_sub:${driver.id}`);
+
+  // Пересылаем фото в админ-чат
+  const photo = ctx.message.photo.at(-1)!; // наибольшее разрешение
+  await bot.api.sendPhoto(ADMIN_CHAT_ID, photo.file_id, {
+    caption:
+      `📋 *Чек на подписку*\n\n` +
+      `👤 Водитель: *${driver.name}*\n` +
+      `🔑 Код: \`${code}\`\n` +
+      `🆔 ID: \`${driver.id}\`\n\n` +
+      `Выберите тариф для активации:`,
+    parse_mode: 'Markdown',
+    reply_markup: keyboard,
+  });
+
+  // Снимаем флаг ожидания
+  const newState = { ...regState };
+  delete newState.awaiting_receipt;
+  await supabaseAdmin.from('tender_drivers')
+    .update({ reg_state: newState })
+    .eq('id', driver.id);
+
+  // Подтверждаем водителю
+  const ackMsgs: Record<string, string> = {
+    ru: '📨 Чек получен! Оператор проверит его и активирует подписку в ближайшее время.',
+    ka: '📨 ქვითარი მიღებულია! ოპერატორი შეამოწმებს და გააქტიურებს გამოწერას მალე.',
+    en: '📨 Receipt received! The operator will review it and activate your subscription shortly.',
+  };
+  await ctx.reply(ackMsgs[lang] ?? ackMsgs.ru);
+});
+
+// ─── Одобрение подписки оператором ───────────────────────────────────────────
+
+async function handleApproveSubscription(ctx: Context) {
+  const parts = ctx.callbackQuery!.data!.split(':');
+  // approve_sub:<driver_id>:<plan_id>
+  if (parts.length !== 3) { await ctx.answerCallbackQuery({ text: 'Ошибка формата' }); return; }
+
+  const [, driverId, planId] = parts;
+  const plan = TARIFF_PLANS.find(p => p.id === (planId as TariffPlanId));
+  if (!plan) { await ctx.answerCallbackQuery({ text: 'Неизвестный тариф' }); return; }
+
+  const { data: driver } = await supabaseAdmin
+    .from('tender_drivers')
+    .select('id, name, telegram_id, driver_language, subscription_expires_at')
+    .eq('id', driverId)
+    .maybeSingle();
+
+  if (!driver) {
+    await ctx.answerCallbackQuery({ text: '❌ Водитель не найден', show_alert: true });
+    return;
+  }
+
+  // Атомарный апдейт: если подписка ещё активна — продлеваем сверху,
+  // если истекла или NULL — отсчёт с NOW().
+  // COALESCE(subscription_expires_at, NOW()) + INTERVAL 'X days'
+  // но не меньше чем NOW() + X days (чтобы не урезать при продлении заранее).
+  const { error } = await supabaseAdmin.rpc('extend_driver_subscription', {
+    p_driver_id: driverId,
+    p_days:      plan.days,
+  });
+
+  if (error) {
+    console.error('[handleApproveSubscription] rpc error:', error.message);
+    await ctx.answerCallbackQuery({ text: '❌ Ошибка БД. Попробуйте ещё раз.', show_alert: true });
+    return;
+  }
+
+  // Читаем финальную дату для уведомления водителю
+  const { data: updated } = await supabaseAdmin
+    .from('tender_drivers')
+    .select('subscription_expires_at')
+    .eq('id', driverId)
+    .single();
+
+  const expiresAt = updated?.subscription_expires_at as string | null;
+  const expiresStr = expiresAt
+    ? new Date(expiresAt).toLocaleDateString('ru-RU', { day: 'numeric', month: 'long', year: 'numeric' })
+    : '—';
+
+  const operatorName = ctx.from!.first_name ?? 'Оператор';
+
+  // Обновляем сообщение в админ-чате
+  await ctx.editMessageCaption({
+    caption:
+      `✅ *Подписка активирована*\n\n` +
+      `👤 Водитель: *${driver.name}*\n` +
+      `📦 Тариф: *${plan.label}* (${plan.price} ₾)\n` +
+      `📅 Действует до: *${expiresStr}*\n` +
+      `👮 Оператор: ${operatorName}`,
+    parse_mode: 'Markdown',
+  }).catch(() => {/* сообщение могло быть удалено */});
+
+  await ctx.answerCallbackQuery({ text: `✅ Подписка для ${driver.name} активирована!` });
+
+  // Уведомляем водителя на его языке
+  if (driver.telegram_id) {
+    const lang = (driver.driver_language as string) ?? 'ru';
+    const driverMsgs: Record<string, string> = {
+      ru: `🚀 Ваша подписка успешно продлена до ${expiresStr}! Доступ к заказам открыт. Удачной работы!`,
+      ka: `🚀 თქვენი გამოწერა წარმატებით გაგრძელდა ${expiresStr}-მდე! შეკვეთებზე წვდომა გახსნილია. წარმატებებს გისურვებთ!`,
+      en: `🚀 Your subscription has been renewed until ${expiresStr}! Access to orders is now open. Good luck!`,
+    };
+    await bot.api
+      .sendMessage(driver.telegram_id as number, driverMsgs[lang] ?? driverMsgs.ru)
+      .catch(e => console.error('[subscription notify driver]', e));
+  }
+}
+
+// ─── Отклонение платежа оператором ───────────────────────────────────────────
+
+async function handleRejectSubscription(ctx: Context) {
+  const driverId = ctx.callbackQuery!.data!.split(':')[1];
+  if (!driverId) { await ctx.answerCallbackQuery({ text: 'Ошибка формата' }); return; }
+
+  const { data: driver } = await supabaseAdmin
+    .from('tender_drivers')
+    .select('id, name, telegram_id, driver_language')
+    .eq('id', driverId)
+    .maybeSingle();
+
+  const operatorName = ctx.from!.first_name ?? 'Оператор';
+  const driverName   = driver?.name ?? 'Неизвестный';
+
+  await ctx.editMessageCaption({
+    caption:
+      `❌ *Платёж отклонён*\n\n` +
+      `👤 Водитель: *${driverName}*\n` +
+      `👮 Оператор: ${operatorName}`,
+    parse_mode: 'Markdown',
+  }).catch(() => {});
+
+  await ctx.answerCallbackQuery({ text: `Платёж для ${driverName} отклонён` });
+
+  if (driver?.telegram_id) {
+    const lang = (driver.driver_language as string) ?? 'ru';
+    const rejectMsgs: Record<string, string> = {
+      ru: '❌ Ваш платёж не прошёл проверку оператора. Пожалуйста, свяжитесь с поддержкой или попробуйте снова (/topup).',
+      ka: '❌ თქვენი გადახდა ვერ გაიარა ოპერატორის შემოწმება. დაუკავშირდით მხარდაჭერას ან სცადეთ თავიდან (/topup).',
+      en: '❌ Your payment was not confirmed by the operator. Please contact support or try again (/topup).',
+    };
+    await bot.api
+      .sendMessage(driver.telegram_id as number, rejectMsgs[lang] ?? rejectMsgs.ru)
+      .catch(e => console.error('[reject notify driver]', e));
+  }
+}
+
+// ─── SQL-функция extend_driver_subscription (создать в Supabase) ──────────────
+// CREATE OR REPLACE FUNCTION extend_driver_subscription(p_driver_id uuid, p_days int)
+// RETURNS void LANGUAGE plpgsql SECURITY DEFINER AS $$
+// BEGIN
+//   UPDATE tender_drivers SET
+//     subscription_expires_at = GREATEST(COALESCE(subscription_expires_at, NOW()), NOW())
+//                               + (p_days || ' days')::interval
+//   WHERE id = p_driver_id;
+// END; $$;
+
 export async function sendTenderToDrivers(orderId: string): Promise<void> {
   const { data: order } = await supabaseAdmin
     .from('tender_orders')
@@ -1271,7 +1872,8 @@ export async function sendTenderToDrivers(orderId: string): Promise<void> {
     .from('tender_drivers')
     .select('id, telegram_id, name, driver_language, telegram_chat_id, specialization')
     .eq('status', 'active')
-    .not('telegram_id', 'is', null);
+    .not('telegram_id', 'is', null)
+    .gt('subscription_expires_at', new Date().toISOString());
 
   const filteredDrivers = (drivers ?? []).filter(
     (d) => !d.specialization || allowedSpecs.includes(d.specialization)
@@ -1352,7 +1954,11 @@ async function checkAndNudgeDrivers(orderId: string): Promise<void> {
   if (!order || order.status !== 'bidding') return;
 
   const { data: drivers } = await supabaseAdmin
-    .from('tender_drivers').select('telegram_id, driver_language').eq('status', 'active').not('telegram_id', 'is', null);
+    .from('tender_drivers')
+    .select('telegram_id, driver_language')
+    .eq('status', 'active')
+    .not('telegram_id', 'is', null)
+    .gt('subscription_expires_at', new Date().toISOString());
   if (!drivers) return;
 
   const msgs: Record<string, string> = {

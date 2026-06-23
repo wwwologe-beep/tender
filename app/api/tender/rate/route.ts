@@ -12,7 +12,7 @@ export async function POST(req: NextRequest) {
 
     const { data: order } = await supabaseAdmin
       .from('tender_orders')
-      .select('id, status, rated_at')
+      .select('id, status, rated_at, client_rating')
       .eq('token', order_token)
       .single();
 
@@ -20,13 +20,13 @@ export async function POST(req: NextRequest) {
     if (order.status !== 'completed') return NextResponse.json({ error: 'Заказ не завершён' }, { status: 400 });
     if (order.rated_at) return NextResponse.json({ error: 'Уже оценено' }, { status: 409 });
 
-    // Сохраняем оценку на заказе
+    // Сохраняем оценку и ставим rated_at — защита от повторного голосования
     await supabaseAdmin
       .from('tender_orders')
       .update({ rated_at: new Date().toISOString(), client_rating: stars })
       .eq('id', order.id);
 
-    // Обновляем рейтинг исполнителя
+    // Обновляем рейтинг исполнителя через rating_sum/rating_count
     const { data: driver } = await supabaseAdmin
       .from('tender_drivers')
       .select('rating_sum, rating_count')
@@ -41,7 +41,7 @@ export async function POST(req: NextRequest) {
         .update({
           rating_sum: newSum,
           rating_count: newCount,
-          rating: Math.round((newSum / newCount) * 10) / 10,
+          rating: Math.round((newSum / newCount) * 100) / 100,
         })
         .eq('id', driver_id);
     }

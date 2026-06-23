@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { supabaseAdmin } from '@/lib/supabase';
-import { translateFaqEntry } from '@/lib/ai';
+import { translateFaqAnswer } from '@/lib/ai';
 import { rebuildOrderFaq } from '@/lib/ai-advisor';
 import { refreshAllCards } from '@/lib/telegram/card';
 
@@ -12,6 +12,9 @@ export async function POST(req: NextRequest) {
 
     if (!question_id || !answer?.trim()) {
       return NextResponse.json({ error: 'question_id и answer обязательны' }, { status: 400 });
+    }
+    if (!client_phone) {
+      return NextResponse.json({ error: 'client_phone обязателен' }, { status: 400 });
     }
 
     const { data: question } = await supabaseAdmin
@@ -34,8 +37,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: 'Нет доступа' }, { status: 403 });
     }
 
-    const context = order.live_brief_ai ?? order.cargo_description ?? '';
-    const translated = await translateFaqEntry(answer.trim(), lang as 'ru' | 'ka' | 'en', context);
+    const translated = await translateFaqAnswer(answer.trim(), lang as 'ru' | 'ka' | 'en');
 
     await supabaseAdmin
       .from('order_questions')
