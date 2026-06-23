@@ -1,15 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import OpenAI from 'openai';
 
-const client = new OpenAI({
-  baseURL: 'https://openrouter.ai/api/v1',
-  apiKey:  process.env.OPENROUTER_API_KEY ?? '',
-  defaultHeaders: {
-    'HTTP-Referer': 'https://mushebi.ge',
-    'X-Title':      'mushebi.ge marketplace',
-  },
-});
-
 export interface AnalyzeResponse {
   hint:         string | null;
   refined_text: string | null;
@@ -244,6 +235,15 @@ export async function POST(req: NextRequest) {
     if (!text || text.trim().length < 10) {
       return NextResponse.json<AnalyzeResponse>({ hint: null, refined_text: null });
     }
+
+    const client = new OpenAI({
+      baseURL: 'https://openrouter.ai/api/v1',
+      apiKey:  process.env.OPENROUTER_API_KEY ?? 'dummy',
+      defaultHeaders: {
+        'HTTP-Referer': 'https://mushebi.ge',
+        'X-Title':      'mushebi.ge marketplace',
+      },
+    });
 
     const completion = await client.chat.completions.create({
       model:       'google/gemini-2.5-flash',
