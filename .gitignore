@@ -33,6 +33,10 @@ yarn-error.log*
 # env files (can opt-in for committing if needed)
 .env*
 
+# secrets (SIP credentials, SSH keys) - never commit
+kamatera/key.env
+asterisk/key.md
+
 # vercel
 .vercel
 
