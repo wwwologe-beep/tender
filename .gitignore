@@ -43,3 +43,7 @@ asterisk/key.md
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# python
+__pycache__/
+*.pyc

@@ -25,7 +25,7 @@ interface ChatMessage {
 
 // ─── Сбор контекста заказа из базы ──────────────────────────────────────────
 
-async function buildOrderContext(orderId: string, role: AdvisorRole, driverLang = 'ru'): Promise<string> {
+export async function buildOrderContext(orderId: string, role: AdvisorRole, driverLang = 'ru'): Promise<string> {
   const [orderRes, bidsRes, questionsRes, marketRes] = await Promise.all([
     supabaseAdmin
       .from('tender_orders')

@@ -12,7 +12,7 @@
 import { supabaseAdmin } from '@/lib/supabase';
 
 // Зеркало из bot.ts — какие специализации подходят под категорию заказа
-const CATEGORY_TO_SPECS: Record<string, string[]> = {
+export const CATEGORY_TO_SPECS: Record<string, string[]> = {
   moving:      ['mover', 'driver', 'handyman', 'moving'],
   cleaning:    ['cleaner', 'handyman', 'cleaning'],
   repair:      ['handyman', 'repair', 'builder'],

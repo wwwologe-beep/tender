@@ -44,6 +44,10 @@
 | **Рынок** | `market_snapshots` | `order_id`, `category`, `final_price`, `avg_bid`, `min_bid`, `max_bid`, `bid_count` |
 | **OTP коды** | `client_otp_codes` | `phone`, `code`, `expires_at` (10 мин) |
 | **Клиенты** | `tender_clients` | `phone`, `session_token`, `last_login` |
+| **Холодные контакты** | `cold_contacts` | `phone`, `specialization`, `status` (active/do_not_call/converted), `converted_driver_id` |
+| **Кандидаты на обзвон** | `call_candidates` | `order_id`, `candidate_type` (driver/cold_contact), `match_score`, `rank` |
+| **Последовательности звонков** | `order_call_sequences` | `order_id`, `status` (queued→calling→advancing→succeeded/exhausted), `current_position` |
+| **Попытки звонков** | `order_call_attempts` | `sequence_id`, `candidate_id`, `status`, `outcome`, `outcome_data` |
 
 ## 5. MULTI-AGENT ECOSYSTEM (THE SOUL)
 
@@ -124,6 +128,8 @@ Anon-клиент (браузер) должен иметь READ доступ к:
 | `gemini-flash-1.5` → 404 | Заменено на `google/gemini-2.5-flash` | ✅ Исправлено |
 | Jaccard dedup кросс-языковой | Двухуровневый dedup: Jaccard + AI | ⚠️ В планах |
 | `rebuildOrderFaq` fire-and-forget | На Vercel норма, локально — race | ⚠️ Принято |
+| `CATEGORY_TO_SPECS` дублирована и разъехалась (`bot.ts` vs `notification-queue.ts`) | Не исправлено — `lib/orchestrator/matching.ts` импортирует версию из `notification-queue.ts`, не плодит третью копию | ⚠️ Известный техдолг |
+| Order Call Orchestrator (см. `ARCHITECTURE.md` §9) применён в коде, но не применена миграция и не настроены env-переменные | Требуется: применить `20260714_order_call_orchestrator.sql`, задать `ORCHESTRATOR_BRIDGE_SECRET`/`ASTERISK_BRIDGE_URL` и др., `pip install aiohttp` на VPS | ⚠️ Готово к деплою, не протестировано |
 
 ## 12. SCRIPTS
 

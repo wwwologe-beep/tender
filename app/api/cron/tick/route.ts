@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { supabaseAdmin } from '@/lib/supabase';
 import { bot } from '@/lib/telegram/bot';
+import { advanceCallSequences } from '@/lib/orchestrator/tick';
 
 // Vercel Cron: каждые 10 минут
 // Выполняет 3 задачи: nudge, напоминание клиенту, таймаут selected
@@ -20,6 +21,7 @@ export async function GET(req: NextRequest) {
     resetStuckBotStates().then(r => results.push(r)),
     remindMeeting().then(r => results.push(r)),
     requestRatings().then(r => results.push(r)),
+    advanceCallSequences().then(r => results.push(r)),
   ]);
 
   console.log('[cron/tick]', results.join(' | '));

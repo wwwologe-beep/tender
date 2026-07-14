@@ -4,6 +4,8 @@ import { supabaseAdmin } from '@/lib/supabase';
 import { sendTenderToDrivers } from '@/lib/telegram/bot';
 import { enqueueOrderNotifications } from '@/lib/notification-queue';
 import { analyzeOrder, validateOrderCompleteness } from '@/lib/ai';
+import { buildCallCandidates } from '@/lib/orchestrator/matching';
+import { createCallSequence } from '@/lib/orchestrator/sequence';
 
 interface CreateOrderBody {
   cargo_description?: string;
@@ -131,6 +133,17 @@ export async function POST(req: NextRequest) {
     enqueueOrderNotifications(data.id).catch(e =>
       console.error('[enqueueOrderNotifications]', e)
     );
+
+    // Orchestrator: строим ранжированный список кандидатов для обзвона (драйверы + холодные
+    // контакты) и создаём state machine. Звонок НЕ инициируется здесь — этим занимается
+    // cron/tick (advanceCallSequences), чтобы не добавлять задержку/точки отказа телефонии
+    // в запрос создания заказа и соблюдать глобальный лимит одновременных звонков.
+    try {
+      const { built } = await buildCallCandidates(data.id);
+      if (built > 0) await createCallSequence(data.id);
+    } catch (e) {
+      console.error('[orchestrator/buildCallCandidates]', e);
+    }
 
     const clientUrl = `https://mushebi.ge/feed/${data.token}`;
 

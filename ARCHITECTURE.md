@@ -525,13 +525,59 @@ CREATE POLICY "all" ON tender_clients FOR ALL USING (true) WITH CHECK (true);
 
 ---
 
-## 9. AI-телефония (добавлено 14.07.2026, статус: proof-of-concept)
+## 9. AI-телефония + Order Call Orchestrator (добавлено 14.07.2026, статус: реализовано, не протестировано на реальных звонках)
 
 ### Концепция
 
-Расширение платформы за пределы текстового AI-советника (`lib/ai-advisor.ts`) в голосовые звонки — AI сможет проактивно звонить исполнителям/клиентам и вести живой голосовой диалог (обсудить заказ, ответить на вопросы), а не только отвечать в чате.
+Расширение платформы за пределы текстового AI-советника (`lib/ai-advisor.ts`) в голосовые звонки. Для каждого нового заказа **Order Orchestrator** автоматически строит ранжированный список кандидатов (зарегистрированные исполнители `tender_drivers` + холодные внешние контакты `cold_contacts`, объединённые в единую абстракцию `call_candidates`), звонит им **последовательно** одному за другим через голосовой AI, и продвигается к следующему кандидату при отказе/молчании — без ручного управления.
 
-**Статус:** работающий proof-of-concept. Двусторонний голосовой диалог подтверждён реальными звонками (русский и грузинский языки), включая перебивание AI собеседником (barge-in). Пока не подключено к бизнес-логике заказов (`tender_orders`) — промпт AI статичный, не тянет данные конкретного заказа.
+**Статус:** двусторонний голосовой диалог (RTP-мост, OpenAI Realtime, barge-in) подтверждён реальными звонками (русский и грузинский). Оркестратор поверх него (матчинг кандидатов, последовательный обзвон, привязка к заказу, tool-calling для структурированного результата) реализован 14.07.2026, но ещё не прогнан на реальном звонке end-to-end — требует применения миграции `20260714_order_call_orchestrator.sql` и настройки env-переменных (см. ниже) перед первым использованием.
+
+### Design summary (Order Orchestrator)
+
+Для каждого нового заказа, синхронно в `app/api/tender/create/route.ts` (там же, где уже выполняется `sendTenderToDrivers()`), строится список кандидатов и создаётся одна строка `order_call_sequences` (state machine: `queued → calling → waiting_commitment → advancing → succeeded | exhausted | cancelled`). Звонок **не** инициируется синхронно в этом запросе — это делает `cron/tick` (внешний пинг раз в ~10 минут, как и все остальные джобы в этом роуте) через новую задачу `advanceCallSequences()` (`lib/orchestrator/tick.ts`), которая: считает глобальный лимит одновременных звонков по всей платформе (не на заказ), стартует новые попытки в рамках свободной ёмкости, и таймаутит зависшие попытки. `voice_bridge.py` получил HTTP-эндпоинт `/originate` (отдельный порт 8090, не путать с ARI-портом 8088), контекст звонка тянет из Next.js (`GET /api/orchestrator/call-context/:attemptId`, переиспользует `buildOrderContext()` из `lib/ai-advisor.ts`), и умеет tool-calling (`report_outcome`) — первое использование tool-calling в проекте. Результат звонка приходит обратно webhook'ом `POST /api/orchestrator/call-result` на `StasisEnd`.
+
+### Новые таблицы (миграция `supabase/migrations/20260714_order_call_orchestrator.sql`)
+
+| Таблица | Назначение |
+|---|---|
+| `cold_contacts` | Внешние контакты, ещё не зарегистрированные как `tender_drivers`. Источник данных для заполнения этой таблицы **пока не существует** — сбор базы (парсинг объявлений, ручной ввод, покупная база) отдельная нерешённая задача. |
+| `call_candidates` | Унифицированная абстракция: одна строка на (заказ, кандидат), где кандидат — либо `tender_drivers`, либо `cold_contacts` (через два независимых частичных unique-constraint, NULL-safe в Postgres). Ранжируется по `match_score`. |
+| `order_call_sequences` | Одна активная state machine на заказ — текущая позиция в списке кандидатов, статус. |
+| `order_call_attempts` | Одна строка на реальный исходящий звонок — статус, исход, привязка к каналу Asterisk. |
+
+Также добавлена колонка `tender_orders.orchestrator_flagged_at` — breadcrumb для "обзвон исчерпан всех кандидатов без успеха, нужны глаза человека" (без UI/уведомления, только queryable флаг).
+
+### Новые файлы (Next.js)
+
+| Файл | Назначение |
+|---|---|
+| `lib/orchestrator/matching.ts` | `buildCallCandidates()` — строит и ранжирует список кандидатов для заказа (переиспользует `CATEGORY_TO_SPECS` из `lib/notification-queue.ts`, не дублирует). |
+| `lib/orchestrator/sequence.ts` | `createCallSequence()`, `advanceToNextCandidate()`, `exhaustSequence()`, `succeedSequence()`, `cancelSequence()` — управление state machine. |
+| `lib/orchestrator/concurrency.ts` | `MAX_CONCURRENT_CALLS` (env `ORCHESTRATOR_MAX_CONCURRENT_CALLS`, default 4), `countInFlightCalls()` — глобальный лимит через Supabase (не in-process state — Vercel-функции не персистентны). |
+| `lib/orchestrator/tick.ts` | `advanceCallSequences()` — ядро цикла, вызывается из `cron/tick`. |
+| `lib/orchestrator/prompts.ts` | `buildVoiceCallInstructions()` — собирает промпт для конкретного звонка (заказ + кандидат + язык), переиспользует `buildOrderContext()` из `lib/ai-advisor.ts`. |
+| `lib/orchestrator/bridge-client.ts` | HTTP-клиент для `POST /originate` на Asterisk-сервер. |
+| `app/api/orchestrator/call-context/[attemptId]/route.ts` | GET, вызывается `voice_bridge.py` при старте звонка. |
+| `app/api/orchestrator/call-result/route.ts` | POST-webhook, вызывается `voice_bridge.py` при завершении звонка. |
+
+### Что происходит при согласии кандидата (outcome = agreed)
+
+- **Если кандидат — существующий `tender_drivers`**: создаётся обычная `tender_bids` строка (`status:'pending'`) — результат звонка становится виден через **уже существующий** клиентский flow принятия ставки (`app/api/tender/accept-bid/route.ts`), а не отдельный "автопринятие по телефону" путь. Финальное подтверждение остаётся за клиентом.
+- **Если кандидат — `cold_contacts`**: создаётся новая `tender_drivers` строка (`status:'pending'`, без `telegram_id`, без активной подписки) — это момент конвертации холодного контакта в исполнителя. **Известный незакрытый разрыв:** вся остальная платформа (ставки, сообщения, FSM Telegram-бота, subscription gate) рассчитана на наличие `telegram_id` — как именно такой "телефонный" исполнитель будет получать заказы и торговаться дальше без Telegram, не решено.
+
+### Переменные окружения для запуска (новые, добавить и в Vercel, и на VPS)
+
+| Переменная | Где | Описание |
+|---|---|---|
+| `ORCHESTRATOR_BRIDGE_SECRET` | Vercel + VPS | Общий bearer-секрет между Next.js и `voice_bridge.py` (генерируется один раз). |
+| `ASTERISK_BRIDGE_URL` | Vercel | `http://<asterisk-host>:8090` — куда Next.js шлёт `/originate`. |
+| `ORCHESTRATOR_MAX_CONCURRENT_CALLS` | Vercel | Опционально, default 4. |
+| `ORCHESTRATOR_ATTEMPT_TIMEOUT_MINUTES` | Vercel | Опционально, default 6. |
+| `ORCHESTRATOR_CALLER_ID` | Vercel | Номер транка, подставляется как caller ID исходящих звонков. |
+| `NEXTJS_APP_URL` | VPS | `https://mushebi.ge` — куда `voice_bridge.py` шлёт запросы обратно. |
+
+Скрипт также требует `pip install aiohttp` на VPS (новая зависимость для `/originate`-сервера, помимо уже установленных `websockets`/`audioop-lts`).
 
 ### Инфраструктура (отдельная от основного приложения)
 
@@ -599,10 +645,15 @@ Auth: Basic <ARI_USER>:<ARI_PASS>
 
 ### Открытые задачи
 
-- Связка звонка с конкретным заказом (`order_id` → контекст в промпт AI, аналогично тому, что `chatWithAdvisor` уже делает для текстового чата)
+- ✅ Связка звонка с конкретным заказом — реализовано через Order Orchestrator (см. выше)
+- ✅ Фиксированный RTP-порт, блокировавший параллельные звонки — исправлено (динамический порт через `bind(('', 0))`)
 - Голос AI субъективно всё ещё звучит немного синтетически — открытая проблема качества, не баг архитектуры
 - SIP-порт (5060/udp) открыт всему интернету и уже сканируется ботами (безобидно, но не защищено — `fail2ban` отложен)
-- Скрипт `voice_bridge.py` пока однопоточный / один активный звонок за раз, не рассчитан на параллельные вызовы
+- Новый `/originate` порт (8090) на VPS защищён только bearer-секретом, не firewalled по IP — тот же класс риска, что и открытый SIP-порт
+- Сбор базы холодных контактов (`cold_contacts`) — таблица готова принимать данные, но источника данных нет
+- Разрыв между `cold_contacts`-конвертированным исполнителем и остальной платформой, завязанной на Telegram (см. выше) — крупнейший известный пробел в опыте
+- Race condition при пересекающихся запусках cron (два одновременных tick могут оба прочитать одно значение concurrency и оба начать звонок, превысив лимит на небольшую величину) — не критично при текущем масштабе (лимит "около 4-5", не жёсткий предел SIP-транка), но не решено
+- Ценовые переговоры, эскалация на человека-оператора — не спроектированы, только queryable breadcrumb (`orchestrator_flagged_at`)
 
 ---
 
