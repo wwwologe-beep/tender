@@ -94,7 +94,11 @@ async function notifyClientWhatsApp(phone: string, questionRu: string, token: st
   const wappiProfile = process.env.WAPPI_PROFILE_ID;
   if (!wappiToken || !wappiProfile) return;
 
-  const url = token ? `https://mushebi.ge/feed/${token}` : 'https://mushebi.ge/feed';
+  // mushebi.ge domain isn't connected yet (see PROJECT.md §4) — using the real prod URL.
+  // TODO: same hardcoding exists in several older routes (cron/tick, questions/ask,
+  // tender/create, messages/send) — worth a single env-var-based fix across all of them later.
+  const base = process.env.NEXT_PUBLIC_APP_URL ?? 'https://tender-navy.vercel.app';
+  const url = token ? `${base}/feed/${token}` : `${base}/feed`;
   const text = `📞 Исполнитель задал вопрос по звонку по вашей заявке:\n\n"${questionRu}"\n\nОтветьте здесь: ${url}`;
 
   await fetch(`https://wappi.pro/api/sync/message/send?profile_id=${wappiProfile}`, {

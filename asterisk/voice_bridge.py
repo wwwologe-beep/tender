@@ -23,7 +23,7 @@ Run with:
     export ARI_PASS=<ari password, see memory/asterisk-telephony.md>
     export OPENAI_API_KEY=$(cat /root/.openai_key)
     export ORCHESTRATOR_BRIDGE_SECRET=<shared secret, also set in Vercel env>
-    export NEXTJS_APP_URL=https://mushebi.ge
+    export NEXTJS_APP_URL=https://tender-navy.vercel.app  # real prod URL; mushebi.ge domain not yet connected, see PROJECT.md
     nohup python3 -u /root/voice_bridge.py > /root/voice_bridge.log 2>&1 &
 
 Dependencies: pip install aiohttp websockets (websockets already required by the pre-orchestrator
@@ -62,7 +62,7 @@ ORCHESTRATOR_BRIDGE_SECRET = os.environ.get("ORCHESTRATOR_BRIDGE_SECRET")
 if not ORCHESTRATOR_BRIDGE_SECRET:
     print("ERROR: set ORCHESTRATOR_BRIDGE_SECRET env var before running this script", file=sys.stderr)
     sys.exit(1)
-NEXTJS_APP_URL = os.environ.get("NEXTJS_APP_URL", "https://mushebi.ge")
+NEXTJS_APP_URL = os.environ.get("NEXTJS_APP_URL", "https://tender-navy.vercel.app")
 
 RTP_LOCAL_HOST = "127.0.0.1"
 ORIGINATE_HTTP_PORT = int(os.environ.get("ORCHESTRATOR_BRIDGE_PORT", "8090"))
