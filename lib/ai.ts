@@ -67,7 +67,10 @@ Analyze the customer's service request and return a JSON object with this exact 
   "price_suggestion": suggested price in GEL (Georgian Lari) as number or null
 }
 Descriptions should be professional, concise, and natural in each language.
-For Georgian (ka), use proper Georgian script.`,
+For Georgian (ka), use proper Georgian script.
+Category rule: any household task involving carrying/lifting furniture (sofas, wardrobes, cabinets),
+boxes, home appliances, or unloading/loading such items MUST be classified as "moving" — never as
+"general". Use "general" only when no other category clearly applies.`,
         },
         {
           role: 'user',

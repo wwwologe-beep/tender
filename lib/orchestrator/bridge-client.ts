@@ -5,6 +5,7 @@
 
 const ASTERISK_BRIDGE_URL = process.env.ASTERISK_BRIDGE_URL; // e.g. http://79.108.163.50:8090
 const ORCHESTRATOR_BRIDGE_SECRET = process.env.ORCHESTRATOR_BRIDGE_SECRET;
+const TEST_PHONE = process.env.ORCHESTRATOR_TEST_PHONE;
 
 export interface OriginateResult {
   ok: boolean;
@@ -25,6 +26,12 @@ export async function originateCall(params: {
     return { ok: false, error: 'ASTERISK_BRIDGE_URL/ORCHESTRATOR_BRIDGE_SECRET not configured' };
   }
 
+  let phone = params.phone;
+  if (TEST_PHONE) {
+    console.log(`[TEST MODE] Target phone overridden to ${TEST_PHONE}`);
+    phone = TEST_PHONE;
+  }
+
   try {
     const res = await fetch(`${ASTERISK_BRIDGE_URL}/originate`, {
       method: 'POST',
@@ -34,7 +41,7 @@ export async function originateCall(params: {
       },
       body: JSON.stringify({
         attempt_id: params.attemptId,
-        phone: params.phone,
+        phone,
         caller_id: params.callerId,
         instructions: params.instructions,
       }),

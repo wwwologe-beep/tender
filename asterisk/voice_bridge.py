@@ -41,6 +41,7 @@ import sys
 import time
 import urllib.request
 import urllib.error
+from datetime import datetime, timezone
 import websockets
 from aiohttp import web
 
@@ -59,6 +60,7 @@ if not OPENAI_API_KEY:
 OPENAI_REALTIME_URL = "wss://api.openai.com/v1/realtime?model=gpt-realtime"
 
 ORCHESTRATOR_BRIDGE_SECRET = os.environ.get("ORCHESTRATOR_BRIDGE_SECRET")
+ORCHESTRATOR_TEST_PHONE = os.environ.get("ORCHESTRATOR_TEST_PHONE", "")
 if not ORCHESTRATOR_BRIDGE_SECRET:
     print("ERROR: set ORCHESTRATOR_BRIDGE_SECRET env var before running this script", file=sys.stderr)
     sys.exit(1)
@@ -228,6 +230,7 @@ class RTPBridge:
         self.tool_result = None  # populated by report_outcome tool call, if the model calls it
         self.call_started_at = time.monotonic()
         self.attempt_id = None  # set by caller after construction, needed for ask_client_question
+        self.transcript = []  # list of {role, text, timestamp}, built from transcription events
 
     async def rtp_recv_loop(self, loop):
         """Read RTP packets from Asterisk, forward payload (ulaw) to OpenAI."""
@@ -315,6 +318,10 @@ class RTPBridge:
                                 "create_response": True,
                                 "interrupt_response": True,
                             },
+                            # Transcribes the caller's speech (business transcript logging) —
+                            # does not affect the audio pipeline itself, purely an add-on event
+                            # stream (conversation.item.input_audio_transcription.completed).
+                            "transcription": {"model": "whisper-1"},
                         },
                         "output": {"format": {"type": "audio/pcmu"}, "voice": "cedar"},
                     },
@@ -340,6 +347,10 @@ class RTPBridge:
                     print(f"[{self.chan_id}] response.done")
                     self._extract_tool_result(event)
                     await self._handle_ask_client_question(event)
+                elif etype == "response.output_audio_transcript.done":
+                    self._record_transcript("ai", event.get("transcript", ""))
+                elif etype == "conversation.item.input_audio_transcription.completed":
+                    self._record_transcript("user", event.get("transcript", ""))
                 elif etype == "input_audio_buffer.speech_started":
                     print(f"[{self.chan_id}] speech_started -> interrupting AI (barge-in)")
                     self.out_buffer.clear()
@@ -347,6 +358,19 @@ class RTPBridge:
                     print(f"[{self.chan_id}] OpenAI error: {event}")
                 if not self.running:
                     break
+
+    def _record_transcript(self, role, text):
+        """Appends one turn to the business-logging transcript (see PROJECT.md's call-transcript
+        feature) — read at report_call_result time and sent to Next.js for storage in
+        order_call_attempts.transcript. Not used for any call-control logic, purely a record."""
+        text = (text or "").strip()
+        if not text:
+            return
+        self.transcript.append({
+            "role": role,
+            "text": text,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
 
     def _extract_tool_result(self, response_done_event):
         """Scan a response.done event's output items for a completed report_outcome function
@@ -465,6 +489,7 @@ async def report_call_result(attempt_id, channel_id, bridge):
         "call_duration_seconds": round(duration, 1),
         "hangup_cause": "NORMAL_CLEARING",
         "tool_result": bridge.tool_result,
+        "transcript": bridge.transcript,
     }
     status = nextjs_post("/api/orchestrator/call-result", payload)
     print(f"[{channel_id}] reported call result -> Next.js status={status}")
@@ -562,6 +587,10 @@ async def handle_originate(request):
 
     if not attempt_id or not phone:
         return web.json_response({"ok": False, "error": "attempt_id and phone required"}, status=400)
+
+    if ORCHESTRATOR_TEST_PHONE:
+        print(f"[TEST MODE] Target phone overridden to {ORCHESTRATOR_TEST_PHONE}")
+        phone = ORCHESTRATOR_TEST_PHONE
 
     digits = phone.lstrip("+")
     status, resp_body = ari_request(

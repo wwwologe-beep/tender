@@ -4,6 +4,12 @@ import { advanceToNextCandidate, succeedSequence } from '@/lib/orchestrator/sequ
 
 type ToolOutcome = 'agreed' | 'declined' | 'needs_follow_up' | 'voicemail';
 
+interface TranscriptEntry {
+  role: 'ai' | 'user' | 'system';
+  text: string;
+  timestamp: string;
+}
+
 interface CallResultBody {
   attempt_id: string;
   channel_id?: string;
@@ -15,6 +21,7 @@ interface CallResultBody {
     available_date?: string;
     notes?: string;
   } | null;
+  transcript?: TranscriptEntry[];
 }
 
 /**
@@ -54,6 +61,7 @@ export async function POST(req: NextRequest) {
       status: 'completed',
       outcome,
       outcome_data: body.tool_result ?? null,
+      transcript: body.transcript ?? null,
       ended_at: new Date().toISOString(),
     })
     .eq('id', attempt.id);
