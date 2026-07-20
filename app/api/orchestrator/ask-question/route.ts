@@ -49,6 +49,11 @@ export async function POST(req: NextRequest) {
       .single(),
   ]);
 
+  // Client Assistant state machine (see PROJECT.md): a driver's ask_client_question puts the
+  // order "on pause" for clarification — client_bridge.py reads missing_info later to know what
+  // to ask the client. Independent of the tender_orders.status bidding/selected/completed
+  // lifecycle, so this write can't collide with it.
+
   if (!order || !candidate) {
     return NextResponse.json({ error: 'order or candidate not found' }, { status: 404 });
   }
@@ -71,6 +76,11 @@ export async function POST(req: NextRequest) {
     status: 'pending',
     answered_by: null,
   });
+
+  await supabaseAdmin
+    .from('tender_orders')
+    .update({ clarification_status: 'clarifying', missing_info: trimmedQuestion })
+    .eq('id', order.id);
 
   if (order.push_subscription && order.token) {
     await sendPush(order.push_subscription as Parameters<typeof sendPush>[0], {
