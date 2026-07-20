@@ -73,6 +73,10 @@ seen_channels = set()
 # VPS, not a stateless Vercel function (unlike everything on the Next.js side, which must keep
 # state in Supabase — see lib/orchestrator/concurrency.ts).
 channel_to_attempt = {}
+# Same lifecycle/rationale as channel_to_attempt above — holds preset instructions for
+# confirmation calls (see handle_originate's optional "instructions" body field), read once
+# at StasisStart and left to fall out of scope after (no explicit cleanup needed, small map).
+channel_to_instructions = {}
 
 
 def ari_request(method, path):
@@ -152,6 +156,56 @@ REPORT_OUTCOME_TOOL = {
     },
 }
 
+REPORT_CONFIRMATION_RESULT_TOOL = {
+    "type": "function",
+    "name": "report_confirmation_result",
+    "description": (
+        "Call this once, at the end of the call, to record whether the person confirmed they "
+        "will do the job or backed out. Always call this before ending the conversation."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "outcome": {
+                "type": "string",
+                "enum": ["confirmed", "declined"],
+                "description": (
+                    "confirmed: they will do the job as agreed. declined: they backed out / "
+                    "can no longer do it / are unreachable-but-you-got-through-to-someone-who-said-no."
+                ),
+            },
+            "notes": {
+                "type": "string",
+                "description": "Short free-text reason if declined, else omit",
+            },
+        },
+        "required": ["outcome"],
+    },
+}
+
+ASK_CLIENT_QUESTION_TOOL = {
+    "type": "function",
+    "name": "ask_client_question",
+    "description": (
+        "Call this when the person asks something about the order that you cannot answer "
+        "from the context you were given (e.g. exact floor, access details, extra items not "
+        "mentioned). This forwards the question to the client immediately — it does NOT wait "
+        "for a reply, the client will answer later via the website. After calling this, tell "
+        "the person you've forwarded the question and the client will get back to them, then "
+        "continue the conversation normally (e.g. move on to price/availability)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "question": {
+                "type": "string",
+                "description": "The question, in the same language the call is being conducted in",
+            },
+        },
+        "required": ["question"],
+    },
+}
+
 
 class RTPBridge:
     """Handles one call's RTP <-> OpenAI Realtime audio bridging."""
@@ -173,6 +227,7 @@ class RTPBridge:
         self.out_buffer = bytearray()  # raw ulaw bytes pending transmission, paced by sender_loop
         self.tool_result = None  # populated by report_outcome tool call, if the model calls it
         self.call_started_at = time.monotonic()
+        self.attempt_id = None  # set by caller after construction, needed for ask_client_question
 
     async def rtp_recv_loop(self, loop):
         """Read RTP packets from Asterisk, forward payload (ulaw) to OpenAI."""
@@ -232,7 +287,7 @@ class RTPBridge:
         self.seq += 1
         self.timestamp += FRAME_BYTES
 
-    async def openai_session(self, instructions):
+    async def openai_session(self, instructions, tools):
         headers = {
             "Authorization": f"Bearer {OPENAI_API_KEY}",
         }
@@ -264,7 +319,7 @@ class RTPBridge:
                         "output": {"format": {"type": "audio/pcmu"}, "voice": "cedar"},
                     },
                     "instructions": instructions,
-                    "tools": [REPORT_OUTCOME_TOOL],
+                    "tools": tools,
                 },
             }))
             print(f"[{self.chan_id}] OpenAI session configured, waiting for events...")
@@ -284,6 +339,7 @@ class RTPBridge:
                 elif etype == "response.done":
                     print(f"[{self.chan_id}] response.done")
                     self._extract_tool_result(event)
+                    await self._handle_ask_client_question(event)
                 elif etype == "input_audio_buffer.speech_started":
                     print(f"[{self.chan_id}] speech_started -> interrupting AI (barge-in)")
                     self.out_buffer.clear()
@@ -301,12 +357,57 @@ class RTPBridge:
         try:
             output = response_done_event.get("response", {}).get("output", [])
             for item in output:
-                if item.get("type") == "function_call" and item.get("name") == "report_outcome":
-                    args = json.loads(item.get("arguments", "{}"))
-                    self.tool_result = args
-                    print(f"[{self.chan_id}] report_outcome tool result: {args}")
+                if item.get("type") != "function_call":
+                    continue
+                name = item.get("name")
+                if name not in ("report_outcome", "report_confirmation_result"):
+                    continue
+                args = json.loads(item.get("arguments", "{}"))
+                self.tool_result = args
+                print(f"[{self.chan_id}] {name} tool result: {args}")
         except Exception as e:
             print(f"[{self.chan_id}] error extracting tool result: {e}")
+
+    async def _handle_ask_client_question(self, response_done_event):
+        """Scan a response.done event for a completed ask_client_question call, forward the
+        question to Next.js (fire-and-forget from the model's perspective — the client answers
+        later on the website, not live on this call), then send back a function_call_output so
+        the model isn't left waiting for a function result and can continue the conversation
+        (per the OpenAI Realtime tool-calling contract: every function_call needs a matching
+        function_call_output before the model will produce further output referencing it)."""
+        try:
+            output = response_done_event.get("response", {}).get("output", [])
+            for item in output:
+                if item.get("type") != "function_call" or item.get("name") != "ask_client_question":
+                    continue
+                call_id = item.get("call_id")
+                args = json.loads(item.get("arguments", "{}"))
+                question = args.get("question", "").strip()
+                if not question:
+                    continue
+                print(f"[{self.chan_id}] ask_client_question: {question}")
+                status = 0
+                if self.attempt_id:
+                    status = nextjs_post(
+                        "/api/orchestrator/ask-question",
+                        {"attempt_id": self.attempt_id, "question": question},
+                    )
+                ok = status in (200, 201)
+                await self.oa_ws.send(json.dumps({
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": json.dumps({
+                            "forwarded": ok,
+                            "note": "Question forwarded to client, they'll reply on the website later." if ok
+                                    else "Failed to forward the question, apologize and suggest they check the website later.",
+                        }),
+                    },
+                }))
+                await self.oa_ws.send(json.dumps({"type": "response.create"}))
+        except Exception as e:
+            print(f"[{self.chan_id}] error handling ask_client_question: {e}")
 
     def stop(self):
         self.running = False
@@ -331,6 +432,26 @@ async def fetch_call_context(attempt_id):
     )
 
 
+async def report_confirmation_result(attempt_id, bridge):
+    """POST /api/orchestrator/confirmation-result on StasisEnd for a winner-confirmation call
+    (synthetic 'confirm:<bidId>' attempt_id). If the model never called
+    report_confirmation_result (e.g. unanswered/hung up before responding), default to
+    'confirmed' rather than 'declined' — a dropped/failed call is far more likely to be a
+    network/answering hiccup than an actual refusal, and defaulting to 'declined' would wrongly
+    unwind a real winner selection on every flaky call."""
+    outcome = 'confirmed'
+    notes = None
+    if bridge.tool_result:
+        outcome = bridge.tool_result.get('outcome', 'confirmed')
+        notes = bridge.tool_result.get('notes')
+    status = nextjs_post("/api/orchestrator/confirmation-result", {
+        "attempt_id": attempt_id,
+        "outcome": outcome,
+        "notes": notes,
+    })
+    print(f"[{attempt_id}] reported confirmation result ({outcome}) -> Next.js status={status}")
+
+
 async def report_call_result(attempt_id, channel_id, bridge):
     """POST /api/orchestrator/call-result to Next.js on StasisEnd. This webhook call is the
     authoritative outcome trigger (not the tool call, which is best-effort enrichment) — if
@@ -348,7 +469,7 @@ async def report_call_result(attempt_id, channel_id, bridge):
     print(f"[{channel_id}] reported call result -> Next.js status={status}")
 
 
-async def handle_call(chan_id, attempt_id=None):
+async def handle_call(chan_id, attempt_id=None, preset_instructions=None):
     print(f"[{chan_id}] handling new call (attempt_id={attempt_id})")
     status, body = ari_request("POST", f"/channels/{chan_id}/answer")
     print(f"[{chan_id}] answer -> {status}")
@@ -388,7 +509,11 @@ async def handle_call(chan_id, attempt_id=None):
     bridge.extmedia_id = extmedia_id
     bridge.attempt_id = attempt_id
 
-    if attempt_id:
+    if preset_instructions:
+        # Caller already built the full instructions text (e.g. a winner-confirmation call —
+        # see handle_originate's "confirmation" kind) — skip the call-context round trip.
+        instructions = preset_instructions
+    elif attempt_id:
         instructions = await fetch_call_context(attempt_id)
     else:
         # Manual/inbound test call with no orchestrator attempt attached — keep the
@@ -398,10 +523,21 @@ async def handle_call(chan_id, attempt_id=None):
             "naturally and ask how you can help."
         )
 
+    # Confirmation calls (winner told "you're selected", may back out) use a different, smaller
+    # tool set than regular candidate-outreach calls — no ask_client_question (not appropriate
+    # after a price is already agreed) and report_confirmation_result instead of report_outcome
+    # (confirmed/declined, not agreed/declined/needs_follow_up/voicemail).
+    is_confirmation_call = bool(attempt_id and attempt_id.startswith("confirm:"))
+    tools = (
+        [REPORT_CONFIRMATION_RESULT_TOOL]
+        if is_confirmation_call
+        else [REPORT_OUTCOME_TOOL, ASK_CLIENT_QUESTION_TOOL]
+    )
+
     loop = asyncio.get_event_loop()
     recv_task = asyncio.create_task(bridge.rtp_recv_loop(loop))
     send_task = asyncio.create_task(bridge.sender_loop())
-    oa_task = asyncio.create_task(bridge.openai_session(instructions))
+    oa_task = asyncio.create_task(bridge.openai_session(instructions, tools))
     return bridge, recv_task, send_task, oa_task
 
 
@@ -421,6 +557,7 @@ async def handle_originate(request):
     attempt_id = body.get("attempt_id")
     phone = body.get("phone")
     caller_id = body.get("caller_id", "")
+    instructions = body.get("instructions")  # optional: skip call-context fetch, see handle_call
 
     if not attempt_id or not phone:
         return web.json_response({"ok": False, "error": "attempt_id and phone required"}, status=400)
@@ -445,7 +582,9 @@ async def handle_originate(request):
         return web.json_response({"ok": False, "error": "could not parse ARI response"}, status=502)
 
     channel_to_attempt[chan_id] = attempt_id
-    print(f"[{chan_id}] originate -> attempt_id={attempt_id}, phone={phone}")
+    if instructions:
+        channel_to_instructions[chan_id] = instructions
+    print(f"[{chan_id}] originate -> attempt_id={attempt_id}, phone={phone}, preset_instructions={bool(instructions)}")
     return web.json_response({"ok": True, "channel_id": chan_id})
 
 
@@ -483,7 +622,8 @@ async def main():
                     continue
                 seen_channels.add(chan_id)
                 attempt_id = channel_to_attempt.get(chan_id)
-                bridge, recv_task, send_task, oa_task = await handle_call(chan_id, attempt_id)
+                preset_instructions = channel_to_instructions.pop(chan_id, None)
+                bridge, recv_task, send_task, oa_task = await handle_call(chan_id, attempt_id, preset_instructions)
                 active[chan_id] = (bridge, recv_task, send_task, oa_task)
             elif etype == "StasisEnd":
                 chan_id = event["channel"]["id"]
@@ -498,7 +638,11 @@ async def main():
                     ari_request("DELETE", f"/channels/{bridge.extmedia_id}")
 
                     attempt_id = channel_to_attempt.pop(chan_id, None)
-                    if attempt_id:
+                    if attempt_id and attempt_id.startswith("confirm:"):
+                        # Synthetic id, no order_call_attempts row — report to the dedicated
+                        # confirmation-result endpoint instead of call-result.
+                        asyncio.create_task(report_confirmation_result(attempt_id, bridge))
+                    elif attempt_id:
                         asyncio.create_task(report_call_result(attempt_id, chan_id, bridge))
 
 

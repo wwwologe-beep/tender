@@ -16,6 +16,10 @@ export async function originateCall(params: {
   attemptId: string;
   phone: string;
   callerId: string;
+  /** Skips the bridge's call-context fetch and speaks these instructions directly — used for
+   *  one-way notification calls (e.g. winner confirmation) that aren't part of the candidate
+   *  call-sequence state machine and have no order_call_attempts row. */
+  instructions?: string;
 }): Promise<OriginateResult> {
   if (!ASTERISK_BRIDGE_URL || !ORCHESTRATOR_BRIDGE_SECRET) {
     return { ok: false, error: 'ASTERISK_BRIDGE_URL/ORCHESTRATOR_BRIDGE_SECRET not configured' };
@@ -32,6 +36,7 @@ export async function originateCall(params: {
         attempt_id: params.attemptId,
         phone: params.phone,
         caller_id: params.callerId,
+        instructions: params.instructions,
       }),
       signal: AbortSignal.timeout(10_000),
     });

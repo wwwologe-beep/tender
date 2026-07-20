@@ -3,6 +3,7 @@ import { supabaseAdmin } from '@/lib/supabase';
 import { InlineKeyboard } from 'grammy';
 import { bot } from '@/lib/telegram/bot';
 import { buildCard, type CardOrder, type CardDriver, type CardBid } from '@/lib/telegram/card';
+import { confirmWinnerByCall } from '@/lib/orchestrator/confirmation-call';
 
 export async function POST(req: NextRequest) {
   try {
@@ -65,6 +66,16 @@ export async function POST(req: NextRequest) {
     await supabaseAdmin.from('tender_drivers')
       .update({ active_order_id: resolvedOrderId })
       .eq('id', winBid.driver_id);
+
+    // Fire-and-forget: победителям без Telegram (например, конвертированным из cold_contacts
+    // голосовым звонком) больше неоткуда узнать, что их выбрали — звоним и подтверждаем.
+    // Telegram-исполнители уже получают уведомление через bot.api ниже, звонок им не нужен.
+    confirmWinnerByCall({
+      orderId: resolvedOrderId,
+      bidId: bid_id,
+      driverId: winBid.driver_id,
+      amount: winBid.amount ?? 0,
+    }).catch(() => {});
 
     // Берём все ставки с данными исполнителей
     const { data: allBids } = await supabaseAdmin

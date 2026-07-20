@@ -54,6 +54,27 @@ const TOOL_INSTRUCTION: Record<string, string> = {
   ),
 };
 
+const ASK_QUESTION_INSTRUCTION: Record<string, string> = {
+  ka: (
+    'თუ შემსრულებელი დაგისვამს კითხვას შეკვეთის შესახებ, რომელზეც ზემოთ მოცემულ ' +
+    'ინფორმაციაში პასუხი არ არის — გამოიძახე ask_client_question ფუნქცია ამ კითხვით. ' +
+    'პასუხს დაუყოვნებლივ არ მიიღებ — უთხარი შემსრულებელს, რომ კითხვას გადასცემ ' +
+    'დამკვეთს და ის მიიღებს პასუხს საიტზე, შემდეგ გააგრძელე საუბარი ჩვეულებრივად.'
+  ),
+  en: (
+    "If the person asks something about the order that isn't covered in the context above, " +
+    "call the ask_client_question function with that question. You won't get an answer " +
+    "immediately — tell them you're forwarding it to the client and they'll get a reply on " +
+    'the website, then continue the conversation normally.'
+  ),
+  ru: (
+    'Если исполнитель задаёт вопрос о заказе, на который нет ответа в информации выше — ' +
+    'вызови функцию ask_client_question с этим вопросом. Ответ придёт не сразу — скажи ' +
+    'исполнителю, что передаёшь вопрос заказчику и ответ придёт на сайте, затем продолжи ' +
+    'разговор как обычно.'
+  ),
+};
+
 const GREETING_INTRO: Record<string, (name: string) => string> = {
   ka: name => `მოსაუბრის სახელია ${name || 'უცნობია'}.`,
   en: name => `The person you're calling is named ${name || 'unknown'}.`,
@@ -107,6 +128,7 @@ export async function buildVoiceCallInstructions(
     orderRow?.order_number ? `Order #${orderRow.order_number}.` : '',
     orderContext,
     budgetLine,
+    ASK_QUESTION_INSTRUCTION[lang],
     TOOL_INSTRUCTION[lang],
   ]
     .filter(Boolean)
