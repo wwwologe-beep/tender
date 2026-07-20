@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { supabaseAdmin } from '@/lib/supabase';
 import { advanceToNextCandidate, succeedSequence } from '@/lib/orchestrator/sequence';
+import { originateNextAttempt } from '@/lib/orchestrator/tick';
+import { countInFlightCalls, MAX_CONCURRENT_CALLS } from '@/lib/orchestrator/concurrency';
 
 type ToolOutcome = 'agreed' | 'declined' | 'needs_follow_up' | 'voicemail';
 
@@ -71,6 +73,32 @@ export async function POST(req: NextRequest) {
     await succeedSequence(attempt.sequence_id, attempt.candidate_id);
   } else {
     await advanceToNextCandidate(attempt.sequence_id);
+
+    // Don't immediately call the next candidate if this attempt just put the order on pause
+    // for clarification (ask_client_question mid-call) — calling more people while we're
+    // waiting on the client's answer would be pointless and confusing. Otherwise, call the
+    // next candidate right away rather than waiting for the next cron/tick (~10 min) — same
+    // "don't make the client wait" reasoning as the immediate first call at order creation.
+    const { data: order } = await supabaseAdmin
+      .from('tender_orders')
+      .select('clarification_status')
+      .eq('id', attempt.order_id)
+      .single();
+
+    if (order?.clarification_status !== 'clarifying') {
+      const { data: seq } = await supabaseAdmin
+        .from('order_call_sequences')
+        .select('id, order_id, current_position, candidate_count, status')
+        .eq('id', attempt.sequence_id)
+        .single();
+
+      if (seq && ['queued', 'advancing'].includes(seq.status)) {
+        const inFlight = await countInFlightCalls();
+        if (inFlight < MAX_CONCURRENT_CALLS) {
+          await originateNextAttempt(seq);
+        }
+      }
+    }
   }
 
   return NextResponse.json({ ok: true, outcome });

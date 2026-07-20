@@ -3,6 +3,7 @@ import { supabaseAdmin } from '@/lib/supabase';
 import { translateFaqAnswer } from '@/lib/ai';
 import { rebuildOrderFaq } from '@/lib/ai-advisor';
 import { refreshAllCards } from '@/lib/telegram/card';
+import { resolveClarificationAndRequeue } from '@/lib/orchestrator/clarification';
 
 // POST /api/questions/answer
 // Body: { question_id, answer, lang, client_phone }
@@ -28,7 +29,7 @@ export async function POST(req: NextRequest) {
 
     const { data: order } = await supabaseAdmin
       .from('tender_orders')
-      .select('id, token, client_phone, cargo_description, live_brief_ai')
+      .select('id, token, client_phone, cargo_description, live_brief_ai, clarification_status, missing_info')
       .eq('id', question.order_id)
       .single();
 
@@ -56,6 +57,14 @@ export async function POST(req: NextRequest) {
 
     // Пересобираем FAQ и live_brief_ai
     await rebuildOrderFaq(order.id).catch(console.error);
+
+    // Client Assistant clarification flow: if this is the question that put the order on pause
+    // (clarification_status='clarifying'), an answer via the web/Telegram channel resolves the
+    // pause exactly like a client_bridge.py voice answer would — the driver call queue must not
+    // stay stuck just because the client happened to answer here instead of on a phone call.
+    if (order.clarification_status === 'clarifying' && order.missing_info === question.question_original) {
+      await resolveClarificationAndRequeue(order.id).catch(console.error);
+    }
 
     return NextResponse.json({ ok: true });
   } catch (err) {
