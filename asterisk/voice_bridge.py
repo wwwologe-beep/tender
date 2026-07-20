@@ -385,13 +385,14 @@ class RTPBridge:
                 question = args.get("question", "").strip()
                 if not question:
                     continue
-                print(f"[{self.chan_id}] ask_client_question: {question}")
+                print(f"[{self.chan_id}] ask_client_question: {question} (attempt_id={self.attempt_id})")
                 status = 0
                 if self.attempt_id:
                     status = nextjs_post(
                         "/api/orchestrator/ask-question",
                         {"attempt_id": self.attempt_id, "question": question},
                     )
+                print(f"[{self.chan_id}] ask-question forward -> Next.js status={status}")
                 ok = status in (200, 201)
                 await self.oa_ws.send(json.dumps({
                     "type": "conversation.item.create",
