@@ -14,20 +14,70 @@ import { buildCallCandidates } from './matching';
 import { createCallSequence } from './sequence';
 import { originateNextAttempt } from './tick';
 import { countInFlightCalls, MAX_CONCURRENT_CALLS } from './concurrency';
+import { callBackWithAnswer } from './answer-callback';
 
 /**
- * Marks an order 'ready' (clears missing_info) and re-enters it into the driver call queue.
- * Safe to call even if the order isn't actually 'clarifying' — a no-op update in that case,
- * callers are expected to check clarification_status themselves first when it matters (e.g.
+ * Marks an order 'ready' (clears missing_info), calls back whoever asked the resolved question
+ * with the client's answer, and re-enters the order into the driver call queue. Safe to call
+ * even if the order isn't actually 'clarifying' — a no-op update in that case, callers are
+ * expected to check clarification_status themselves first when it matters (e.g.
  * questions/answer/route.ts only calls this for the specific question that was blocking).
+ *
+ * questionId is optional because not every caller has it up front (client_bridge.py's
+ * clarification-result callback only knows order_id) — when omitted, this looks up the most
+ * recent pending question on the order, which is the one that set missing_info in the first
+ * place (see ask-question/route.ts).
  */
-export async function resolveClarificationAndRequeue(orderId: string): Promise<void> {
+export async function resolveClarificationAndRequeue(
+  orderId: string,
+  questionId?: string,
+  answer?: string
+): Promise<void> {
   await supabaseAdmin
     .from('tender_orders')
-    .update({ clarification_status: 'ready', missing_info: null })
+    .update({
+      clarification_status: 'ready',
+      missing_info: null,
+      clarification_started_at: null,
+      clarification_call_attempted_at: null,
+    })
     .eq('id', orderId);
 
+  await callBackDriverWithAnswer(orderId, questionId, answer);
   await requeueForDriverCalls(orderId);
+}
+
+async function callBackDriverWithAnswer(
+  orderId: string,
+  questionId?: string,
+  answerOverride?: string
+): Promise<void> {
+  try {
+    const { data: question } = questionId
+      ? await supabaseAdmin
+          .from('order_questions')
+          .select('id, question_original, answer_original')
+          .eq('id', questionId)
+          .single()
+      : await supabaseAdmin
+          .from('order_questions')
+          .select('id, question_original, answer_original')
+          .eq('order_id', orderId)
+          .order('created_at', { ascending: false })
+          .limit(1)
+          .maybeSingle();
+
+    const answer = answerOverride ?? question?.answer_original;
+    if (!question || !answer?.trim()) return;
+
+    await callBackWithAnswer({
+      questionId: question.id,
+      question: question.question_original,
+      answer,
+    });
+  } catch (e) {
+    console.error('[clarification/callBackDriverWithAnswer]', e, { orderId });
+  }
 }
 
 /**

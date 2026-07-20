@@ -63,7 +63,7 @@ export async function POST(req: NextRequest) {
     // pause exactly like a client_bridge.py voice answer would — the driver call queue must not
     // stay stuck just because the client happened to answer here instead of on a phone call.
     if (order.clarification_status === 'clarifying' && order.missing_info === question.question_original) {
-      await resolveClarificationAndRequeue(order.id).catch(console.error);
+      await resolveClarificationAndRequeue(order.id, question.id, answer.trim()).catch(console.error);
     }
 
     return NextResponse.json({ ok: true });

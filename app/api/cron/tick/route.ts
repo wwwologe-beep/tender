@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { supabaseAdmin } from '@/lib/supabase';
 import { bot } from '@/lib/telegram/bot';
 import { advanceCallSequences } from '@/lib/orchestrator/tick';
+import { originateClarificationCall } from '@/lib/orchestrator/client-bridge-client';
 
 // Vercel Cron: каждые 10 минут
 // Выполняет 3 задачи: nudge, напоминание клиенту, таймаут selected
@@ -22,6 +23,7 @@ export async function GET(req: NextRequest) {
     remindMeeting().then(r => results.push(r)),
     requestRatings().then(r => results.push(r)),
     advanceCallSequences().then(r => results.push(r)),
+    callClientsForClarification().then(r => results.push(r)),
   ]);
 
   console.log('[cron/tick]', results.join(' | '));
@@ -331,6 +333,61 @@ async function requestRatings(): Promise<string> {
   }
 
   return `ratings: ${requested} requested`;
+}
+
+// ─── 7. Client Assistant: клиент молчит на сайте > 5 минут → звоним ему голосом ──
+
+const CLARIFICATION_CALLER_ID = process.env.ORCHESTRATOR_CALLER_ID ?? '';
+
+/**
+ * If a driver's ask_client_question has left an order in clarification_status='clarifying' for
+ * more than 5 minutes with no answer (via any channel — see lib/orchestrator/clarification.ts),
+ * the client likely hasn't seen the website/WhatsApp notification. Falls back to an automated
+ * voice call via asterisk/client_bridge.py so the order doesn't sit paused indefinitely. Only
+ * tries once per 30 minutes per order (clarification_call_attempted_at) — if the client still
+ * doesn't answer the phone either, this will keep retrying every ~30 min rather than give up
+ * silently, since there's no cheaper fallback channel left to try.
+ */
+async function callClientsForClarification(): Promise<string> {
+  const FIVE_MIN_AGO = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+
+  const { data: orders } = await supabaseAdmin
+    .from('tender_orders')
+    .select('id, client_phone, missing_info, clarification_call_attempted_at, clarification_started_at')
+    .eq('clarification_status', 'clarifying')
+    .not('missing_info', 'is', null)
+    .lt('clarification_started_at', FIVE_MIN_AGO);
+
+  if (!orders?.length) return 'clarification-call: 0 orders';
+
+  let called = 0;
+  for (const order of orders) {
+    if (!order.client_phone || !order.missing_info) continue;
+
+    if (order.clarification_call_attempted_at) {
+      const last = new Date(order.clarification_call_attempted_at).getTime();
+      if (Date.now() - last < 30 * 60 * 1000) continue;
+    }
+
+    const result = await originateClarificationCall({
+      orderId: order.id,
+      clientPhone: order.client_phone,
+      missingInfo: order.missing_info,
+      callerId: CLARIFICATION_CALLER_ID,
+    });
+
+    if (result.ok) {
+      await supabaseAdmin
+        .from('tender_orders')
+        .update({ clarification_call_attempted_at: new Date().toISOString() })
+        .eq('id', order.id);
+      called++;
+    } else {
+      console.error('[cron/callClientsForClarification] originate failed', result.error, { orderId: order.id });
+    }
+  }
+
+  return `clarification-call: ${called} clients called`;
 }
 
 // ─── 4. Сброс зависших bot_state > 2 часов ───────────────────────────────────

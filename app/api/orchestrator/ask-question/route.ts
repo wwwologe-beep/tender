@@ -70,6 +70,7 @@ export async function POST(req: NextRequest) {
   await supabaseAdmin.from('order_questions').insert({
     order_id: order.id,
     driver_id: candidate.driver_id, // null for cold_contact callers — allowed since 20260720
+    candidate_id: attempt.candidate_id, // so we know who to call back once the client answers
     question_original: trimmedQuestion,
     question_lang: lang,
     question_translated: translated,
@@ -79,7 +80,12 @@ export async function POST(req: NextRequest) {
 
   await supabaseAdmin
     .from('tender_orders')
-    .update({ clarification_status: 'clarifying', missing_info: trimmedQuestion })
+    .update({
+      clarification_status: 'clarifying',
+      missing_info: trimmedQuestion,
+      clarification_started_at: new Date().toISOString(),
+      clarification_call_attempted_at: null,
+    })
     .eq('id', order.id);
 
   if (order.push_subscription && order.token) {

@@ -34,7 +34,7 @@ export async function POST(req: NextRequest) {
 
   const { data: order } = await supabaseAdmin
     .from('tender_orders')
-    .select('id, status')
+    .select('id, status, missing_info')
     .eq('id', body.order_id)
     .single();
 
@@ -43,7 +43,31 @@ export async function POST(req: NextRequest) {
   }
 
   if (body.reached === true && body.answer?.trim()) {
-    await resolveClarificationAndRequeue(order.id);
+    // Record the voice answer on the same order_questions row the driver's ask_client_question
+    // created — resolveClarificationAndRequeue reads answer_original from there to know what
+    // to relay back to the driver, same as a website/Telegram answer would.
+    const { data: question } = await supabaseAdmin
+      .from('order_questions')
+      .select('id')
+      .eq('order_id', order.id)
+      .eq('question_original', order.missing_info ?? '')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (question) {
+      await supabaseAdmin
+        .from('order_questions')
+        .update({
+          answer_original: body.answer.trim(),
+          answered_by: 'client',
+          status: 'answered',
+          answered_at: new Date().toISOString(),
+        })
+        .eq('id', question.id);
+    }
+
+    await resolveClarificationAndRequeue(order.id, question?.id, body.answer.trim());
   } else {
     console.log('Clarification attempt failed for order', order.id);
   }
