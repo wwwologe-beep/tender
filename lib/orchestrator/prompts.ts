@@ -9,6 +9,7 @@
  */
 
 import { buildOrderContext } from '@/lib/ai-advisor';
+import { driverPricingRules } from '@/lib/pricing-policy';
 import { supabaseAdmin } from '@/lib/supabase';
 
 interface BuildVoiceCallInstructionsParams {
@@ -128,6 +129,7 @@ export async function buildVoiceCallInstructions(
     orderRow?.order_number ? `Order #${orderRow.order_number}.` : '',
     orderContext,
     budgetLine,
+    driverPricingRules(lang),
     ASK_QUESTION_INSTRUCTION[lang],
     TOOL_INSTRUCTION[lang],
   ]

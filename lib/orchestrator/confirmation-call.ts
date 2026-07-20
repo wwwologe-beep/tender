@@ -13,6 +13,7 @@
  */
 
 import { supabaseAdmin } from '@/lib/supabase';
+import { driverPricingRules } from '@/lib/pricing-policy';
 import { originateCall } from './bridge-client';
 
 const TRUNK_CALLER_ID = process.env.ORCHESTRATOR_CALLER_ID ?? '';
@@ -62,7 +63,10 @@ const CONFIRM_INTRO: Record<string, string> = {
 
 function buildConfirmationInstructions(amount: number, lang: string): string {
   const template = CONFIRM_INTRO[lang] ?? CONFIRM_INTRO.ru;
-  return template.replace('{amount}', String(amount));
+  // The price is already agreed by this point — pricing rules matter here mainly for the case
+  // where the driver tries to renegotiate down/up or suggests going around the platform on
+  // this call, not for setting an initial price (that already happened on the outreach call).
+  return template.replace('{amount}', String(amount)) + '\n\n' + driverPricingRules(lang);
 }
 
 /**
