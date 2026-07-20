@@ -13,6 +13,8 @@ interface TranscriptEntry {
 
 interface ClarificationResultBody {
   order_id: string;
+  reached: boolean;
+  answer?: string;
   transcript?: TranscriptEntry[];
 }
 
@@ -43,12 +45,16 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'order not found' }, { status: 404 });
   }
 
-  await supabaseAdmin
-    .from('tender_orders')
-    .update({ clarification_status: 'ready', missing_info: null })
-    .eq('id', order.id);
+  if (body.reached === true && body.answer?.trim()) {
+    await supabaseAdmin
+      .from('tender_orders')
+      .update({ clarification_status: 'ready', missing_info: null })
+      .eq('id', order.id);
 
-  await requeueForDriverCalls(order.id);
+    await requeueForDriverCalls(order.id);
+  } else {
+    console.log('Clarification attempt failed for order', order.id);
+  }
 
   return NextResponse.json({ ok: true });
 }
