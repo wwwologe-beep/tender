@@ -73,7 +73,7 @@ async function timeoutStaleAttempts(): Promise<number> {
   return stale.length;
 }
 
-interface SequenceRow {
+export interface SequenceRow {
   id: string;
   order_id: string;
   current_position: number;
@@ -86,7 +86,7 @@ interface SequenceRow {
  * the sequence is cancelled — order was already closed via another channel, e.g. a Telegram
  * bid was accepted first, so calling more people is pointless).
  */
-async function originateNextAttempt(seq: SequenceRow): Promise<boolean> {
+export async function originateNextAttempt(seq: SequenceRow): Promise<boolean> {
   const { data: order } = await supabaseAdmin
     .from('tender_orders')
     .select('status')

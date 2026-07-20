@@ -6,6 +6,8 @@ import { enqueueOrderNotifications } from '@/lib/notification-queue';
 import { analyzeOrder, validateOrderCompleteness } from '@/lib/ai';
 import { buildCallCandidates } from '@/lib/orchestrator/matching';
 import { createCallSequence } from '@/lib/orchestrator/sequence';
+import { originateNextAttempt } from '@/lib/orchestrator/tick';
+import { countInFlightCalls, MAX_CONCURRENT_CALLS } from '@/lib/orchestrator/concurrency';
 
 interface CreateOrderBody {
   cargo_description?: string;
@@ -135,12 +137,29 @@ export async function POST(req: NextRequest) {
     );
 
     // Orchestrator: строим ранжированный список кандидатов для обзвона (драйверы + холодные
-    // контакты) и создаём state machine. Звонок НЕ инициируется здесь — этим занимается
-    // cron/tick (advanceCallSequences), чтобы не добавлять задержку/точки отказа телефонии
-    // в запрос создания заказа и соблюдать глобальный лимит одновременных звонков.
+    // контакты) и создаём state machine. Первый звонок инициируем сразу (не ждём cron/tick,
+    // который срабатывает раз в ~10 мин) — иначе клиент, оставивший заявку, полностью зависит
+    // от следующего тика прежде чем хоть кто-то начнёт ему звонить, что для "оперативно решить
+    // вопрос" неприемлемо. Уважаем тот же concurrency gate, что и tick.ts, чтобы одновременное
+    // создание нескольких заказов не обошло лимит через этот путь. Последующие звонки (при
+    // отказе первого кандидата) по-прежнему идут через cron/tick, как и раньше.
     try {
       const { built } = await buildCallCandidates(data.id);
-      if (built > 0) await createCallSequence(data.id);
+      if (built > 0) {
+        const { sequenceId } = await createCallSequence(data.id);
+        if (sequenceId) {
+          const inFlight = await countInFlightCalls();
+          if (inFlight < MAX_CONCURRENT_CALLS) {
+            await originateNextAttempt({
+              id: sequenceId,
+              order_id: data.id,
+              current_position: 0,
+              candidate_count: built,
+              status: 'queued',
+            });
+          }
+        }
+      }
     } catch (e) {
       console.error('[orchestrator/buildCallCandidates]', e);
     }
