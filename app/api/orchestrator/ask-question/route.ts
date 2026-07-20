@@ -9,11 +9,11 @@ import { sendPush } from '@/lib/push';
  * pipeline (translation, dedup-free client notification) so a question asked over the phone
  * shows up in /feed/[token] identically to one asked through the Telegram bot.
  *
- * Only candidates with a driver_id (registered tender_drivers rows) can be recorded in
- * order_questions, since driver_id is NOT NULL on that table. A cold_contact candidate has
- * no tender_drivers row yet — for that case we skip the DB write and only forward the
- * question to the client via push/WhatsApp, same content, just not persisted/displayed in
- * the feed's Q&A thread (there's no driver identity to attribute it to yet).
+ * driver_id is nullable on order_questions (migration 20260720_nullable_question_driver_id.sql)
+ * specifically so cold_contact candidates — who have no tender_drivers row yet — can still have
+ * their voice question show up in /feed/[token]'s Q&A thread, not just as a push/WhatsApp
+ * notification. The feed UI doesn't require driver identity to render a question (see
+ * app/feed/[token]/page.tsx's questions section), so this needed no UI changes.
  */
 export async function POST(req: NextRequest) {
   const authHeader = req.headers.get('authorization');
@@ -62,17 +62,15 @@ export async function POST(req: NextRequest) {
   const translated = await translateFaqEntry(trimmedQuestion, lang, context);
   const questionRu = translated?.ru ?? trimmedQuestion;
 
-  if (candidate.driver_id) {
-    await supabaseAdmin.from('order_questions').insert({
-      order_id: order.id,
-      driver_id: candidate.driver_id,
-      question_original: trimmedQuestion,
-      question_lang: lang,
-      question_translated: translated,
-      status: 'pending',
-      answered_by: null,
-    });
-  }
+  await supabaseAdmin.from('order_questions').insert({
+    order_id: order.id,
+    driver_id: candidate.driver_id, // null for cold_contact callers — allowed since 20260720
+    question_original: trimmedQuestion,
+    question_lang: lang,
+    question_translated: translated,
+    status: 'pending',
+    answered_by: null,
+  });
 
   if (order.push_subscription && order.token) {
     await sendPush(order.push_subscription as Parameters<typeof sendPush>[0], {
