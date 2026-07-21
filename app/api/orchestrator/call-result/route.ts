@@ -56,6 +56,10 @@ export async function POST(req: NextRequest) {
   }
 
   const outcome = deriveOutcome(body);
+  console.log(
+    `✅ [voice-call] outcome=${outcome} for attempt_id=${body.attempt_id} ` +
+    `(tool_result=${JSON.stringify(body.tool_result)})`
+  );
 
   await supabaseAdmin
     .from('order_call_attempts')
@@ -125,6 +129,10 @@ async function handleAgreedOutcome(
   if (!candidate) return;
 
   if (candidate.candidate_type === 'driver' && candidate.driver_id) {
+    console.log(
+      `🗄️  [voice-call] Supabase UPSERT -> tender_bids (order_id=${attempt.order_id}, ` +
+      `driver_id=${candidate.driver_id}, amount=${toolResult?.agreed_price ?? 0})`
+    );
     // Mirrors what a normal bid does, minimally — the call's outcome becomes visible through
     // the EXISTING client-facing accept flow (app/api/tender/accept-bid/route.ts) rather than
     // inventing a parallel "auto-accept via phone" path. Does NOT auto-call accept_bid_atomic

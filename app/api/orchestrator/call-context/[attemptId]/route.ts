@@ -17,6 +17,7 @@ export async function GET(
   }
 
   const { attemptId } = await params;
+  console.log(`🗄️  [voice-call][attemptId=${attemptId}] Supabase SELECT -> order_call_attempts.select("id, order_id, candidate_id, originated_at").eq("id", "${attemptId}").single()`);
 
   const { data: attempt } = await supabaseAdmin
     .from('order_call_attempts')
@@ -27,6 +28,12 @@ export async function GET(
   if (!attempt) {
     return NextResponse.json({ error: 'attempt not found' }, { status: 404 });
   }
+
+  console.log(
+    `🗄️  [voice-call][attemptId=${attemptId}] Supabase SELECT -> ` +
+    `tender_orders.select("id, order_number, category, cargo_description, live_brief_ai").eq("id", "${attempt.order_id}").single() ` +
+    `+ call_candidates.select("candidate_type, display_name, phone, preferred_lang").eq("id", "${attempt.candidate_id}").single()`
+  );
 
   const [{ data: order }, { data: candidate }] = await Promise.all([
     supabaseAdmin
@@ -45,12 +52,19 @@ export async function GET(
     return NextResponse.json({ error: 'order or candidate not found' }, { status: 404 });
   }
 
+  console.log(
+    `🗄️  [voice-call][attemptId=${attemptId}] Supabase RESULT -> tender_orders: ${JSON.stringify(order)} | ` +
+    `call_candidates: ${JSON.stringify(candidate)}`
+  );
+
   const language = candidate.preferred_lang || 'ru';
 
   const instructions = await buildVoiceCallInstructions({
     orderId: order.id,
     candidateName: candidate.display_name,
     language,
+    candidateId: attempt.candidate_id,
+    attemptId,
   });
 
   // Idempotent state transition — the bridge may retry this GET if its own request is slow.

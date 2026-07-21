@@ -63,9 +63,9 @@ const CONFIRM_INTRO: Record<string, string> = {
 
 function buildConfirmationInstructions(amount: number, lang: string): string {
   const template = CONFIRM_INTRO[lang] ?? CONFIRM_INTRO.ru;
-  // The price is already agreed by this point — pricing rules matter here mainly for the case
-  // where the driver tries to renegotiate down/up or suggests going around the platform on
-  // this call, not for setting an initial price (that already happened on the outreach call).
+  // The price is already agreed by this point (driver named it on the earlier outreach call,
+  // per rule #1 in driverPricingRules) — these rules matter here mainly for rule #4/#6: don't
+  // let the driver renegotiate or suggest going around the platform on this confirmation call.
   return template.replace('{amount}', String(amount)) + '\n\n' + driverPricingRules(lang);
 }
 

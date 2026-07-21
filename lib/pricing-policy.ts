@@ -17,30 +17,30 @@ export function driverPricingRules(lang: string): string {
   const rules: Record<string, string> = {
     ru: (
       'ВАЖНЫЕ ПРАВИЛА ЦЕНООБРАЗОВАНИЯ:\n' +
-      '1. Если описание заказа короткое или размытое (мало деталей) — сначала уточни детали. Не называй цену пока не ясны детали.\n' +
-      '2. Если в заказе есть слова: "офис", "компания", "несколько комнат", "рабочие места", "3+ грузчика" — это B2B заказ. Цена B2B в 2-3 раза выше стандартной.\n' +
-      '3. Если клиент/заказчик давит на цену ниже рыночного диапазона — не соглашайся сходу. Объясни: "Это ниже рыночной цены." и почему.\n' +
-      '4. Если возникла жалоба или конфликт — предложи конкретное решение (фотофиксация, частичная компенсация, извинение), не игнорируй.\n' +
-      '5. Никогда не советуй и не соглашайся обходить платформу или работать напрямую в обход неё.\n' +
-      '6. Оценивай заказ исходя из рыночного диапазона ставок и истории — не из имени или языка собеседника.'
+      '1. Это blind-bidding тендер: ЦЕНУ НАЗЫВАЕТ ИСПОЛНИТЕЛЬ, а не ты. Твоя задача — спросить, за сколько он готов взять заказ, и зафиксировать его ответ. Никогда не предлагай цену первым и не называй свою.\n' +
+      '2. Если исполнитель просит подсказать "сколько обычно берут" — не называй конкретную цифру, скажи, что решение за ним, но можешь напомнить детали заказа (этажи, лифт, объём), которые влияют на сложность.\n' +
+      '3. Если в заказе есть слова: "офис", "компания", "несколько комнат", "рабочие места", "3+ грузчика" — это B2B заказ, обычно сложнее и дороже стандартного — упомяни это при уточнении деталей.\n' +
+      '4. Если названная исполнителем цена кажется подозрительно низкой или высокой относительно объёма работы — уточни, что именно входит в эту сумму, но не спорь и не навязывай другую цифру.\n' +
+      '5. Если возникла жалоба или конфликт — предложи конкретное решение (фотофиксация, частичная компенсация, извинение), не игнорируй.\n' +
+      '6. Никогда не советуй и не соглашайся обходить платформу или работать напрямую в обход неё.'
     ),
     ka: (
       'ᲤᲐᲡᲘᲡ ᲒᲐᲜᲡᲐᲖᲦᲕᲠᲘᲡ ᲬᲔᲡᲔᲑᲘ:\n' +
-      '1. თუ შეკვეთის აღწერა მოკლეა ან გაურკვეველია — ჯერ დააზუსტე დეტალები. ფასი — მხოლოდ დეტალების გარკვევის შემდეგ.\n' +
-      '2. თუ შეკვეთაში არის: "ოფისი", "კომპანია", "3+ მუშა", "სამუშაო ადგილები" — ეს B2B შეკვეთაა. ფასი 2-3-ჯერ მეტი სტანდარტულზე.\n' +
-      '3. თუ მოითხოვენ ფასს ბაზრის ქვემოთ — არ დაუთმო მაშინვე. აუხსენი, რომ ეს ბაზრის ფასზე დაბალია.\n' +
-      '4. კონფლიქტის ან საჩივრის შემთხვევაში — შესთავაზე კონკრეტული გადაწყვეტა, ნუ დააიგნორებ.\n' +
-      '5. არასოდეს ურჩიო პლატფორმის გვერდის ავლა.\n' +
-      '6. შეაფასე შეკვეთა ბაზრის დიაპაზონისა და ისტორიის მიხედვით — არა სახელის ან ენის მიხედვით.'
+      '1. ეს არის blind-bidding ტენდერი: ფასს ასახელებს შემსრულებელი, არა შენ. შენი ამოცანაა ჰკითხო, რა ფასად აიღებს შეკვეთას, და დააფიქსირო მისი პასუხი. არასოდეს შესთავაზო ფასი პირველმა და არასოდეს დაასახელო შენი ციფრი.\n' +
+      '2. თუ შემსრულებელი გთხოვს მიახლოებით ღირებულებას — არ დაასახელო კონკრეტული ციფრი, უთხარი, რომ გადაწყვეტილება მასზეა, მაგრამ შეგიძლია შეახსენო შეკვეთის დეტალები (სართულები, ლიფტი, მოცულობა).\n' +
+      '3. თუ შეკვეთაში არის: "ოფისი", "კომპანია", "3+ მუშა", "სამუშაო ადგილები" — ეს B2B შეკვეთაა, ჩვეულებრივ უფრო რთული და ძვირი — აღნიშნე ეს დეტალების დაზუსტებისას.\n' +
+      '4. თუ დასახელებული ფასი საეჭვოდ დაბალი ან მაღალია სამუშაოს მოცულობასთან მიმართებით — დააზუსტე რა შედის ამ თანხაში, მაგრამ ნუ დაობ და ნუ შესთავაზებ სხვა ციფრს.\n' +
+      '5. კონფლიქტის ან საჩივრის შემთხვევაში — შესთავაზე კონკრეტული გადაწყვეტა, ნუ დააიგნორებ.\n' +
+      '6. არასოდეს ურჩიო პლატფორმის გვერდის ავლა.'
     ),
     en: (
       'PRICING RULES:\n' +
-      '1. If the order description is short or vague — clarify details first. Don\'t name a price until details are clear.\n' +
-      '2. If the order mentions "office", "company", "multiple rooms", "workplaces", "3+ workers" — it\'s a B2B order. B2B price is 2-3x higher than standard.\n' +
-      '3. If pressured toward a price below the market range — don\'t give in immediately. Explain that it\'s below market rate.\n' +
-      '4. If a complaint or conflict comes up — offer a concrete resolution, don\'t ignore it.\n' +
-      '5. Never advise or agree to bypassing the platform.\n' +
-      '6. Evaluate the order based on the market bid range and history — not name or language.'
+      "1. This is a blind-bidding tender: THE DRIVER NAMES THE PRICE, not you. Your job is to ask what price they're willing to do the job for and record their answer. Never propose a price first or state your own figure.\n" +
+      '2. If the driver asks you to suggest a typical price — don\'t give a specific number; say it\'s their call, but you can remind them of order details (floors, elevator, volume) that affect difficulty.\n' +
+      '3. If the order mentions "office", "company", "multiple rooms", "workplaces", "3+ workers" — it\'s a B2B order, usually harder and more expensive than standard — mention this while clarifying details.\n' +
+      '4. If the price the driver names seems suspiciously low or high for the amount of work — ask what exactly is included, but don\'t argue or push a different number.\n' +
+      '5. If a complaint or conflict comes up — offer a concrete resolution, don\'t ignore it.\n' +
+      '6. Never advise or agree to bypassing the platform.'
     ),
   };
   return rules[lang] ?? rules.ru;

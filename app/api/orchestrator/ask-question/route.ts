@@ -26,6 +26,8 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'attempt_id and question required' }, { status: 400 });
   }
 
+  console.log(`🔧 [voice-call] ask_client_question(attempt_id=${attempt_id}, question=${JSON.stringify(question)})`);
+
   const { data: attempt } = await supabaseAdmin
     .from('order_call_attempts')
     .select('order_id, candidate_id')
@@ -67,6 +69,7 @@ export async function POST(req: NextRequest) {
   const translated = await translateFaqEntry(trimmedQuestion, lang, context);
   const questionRu = translated?.ru ?? trimmedQuestion;
 
+  console.log(`🗄️  [voice-call] Supabase INSERT -> order_questions (order_id=${order.id}, driver_id=${candidate.driver_id ?? 'null'})`);
   await supabaseAdmin.from('order_questions').insert({
     order_id: order.id,
     driver_id: candidate.driver_id, // null for cold_contact callers — allowed since 20260720

@@ -94,20 +94,31 @@ def ari_request(method, path):
 
 
 def nextjs_get(path):
+    """Every GET to Next.js from this bridge reads from Supabase server-side (e.g.
+    call-context reads tender_orders/tender_drivers for subscription status + order details).
+    Logged here so that DB round-trip is visible in the terminal, not just its result."""
+    print(f"🗄️  Supabase (via Next.js): GET {path}")
     url = f"{NEXTJS_APP_URL}{path}"
     req = urllib.request.Request(url, method="GET")
     req.add_header("Authorization", f"Bearer {ORCHESTRATOR_BRIDGE_SECRET}")
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
-            return resp.status, json.loads(resp.read())
+            status, body = resp.status, json.loads(resp.read())
+            print(f"🗄️  Supabase (via Next.js): GET {path} -> HTTP {status}")
+            return status, body
     except urllib.error.HTTPError as e:
+        print(f"🗄️  Supabase (via Next.js): GET {path} -> HTTP {e.code} (error)")
         return e.code, {}
     except Exception as e:
-        print(f"nextjs_get({path}) failed: {e}")
+        print(f"🗄️  Supabase (via Next.js): GET {path} -> failed: {e}")
         return 0, {}
 
 
 def nextjs_post(path, payload):
+    """Same as nextjs_get but for writes (e.g. call-result inserts/updates order_call_attempts,
+    tender_bids, tender_drivers). Logs the outgoing payload too, since that's the argument the
+    'tool call' is effectively made with from the DB's point of view."""
+    print(f"🗄️  Supabase (via Next.js): POST {path} args={json.dumps(payload, ensure_ascii=False)}")
     url = f"{NEXTJS_APP_URL}{path}"
     data = json.dumps(payload).encode()
     req = urllib.request.Request(url, data=data, method="POST")
@@ -115,12 +126,13 @@ def nextjs_post(path, payload):
     req.add_header("Content-Type", "application/json")
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
+            print(f"🗄️  Supabase (via Next.js): POST {path} -> HTTP {resp.status}")
             return resp.status
     except urllib.error.HTTPError as e:
-        print(f"nextjs_post({path}) HTTP {e.code}: {e.read()}")
+        print(f"🗄️  Supabase (via Next.js): POST {path} -> HTTP {e.code} (error): {e.read()}")
         return e.code
     except Exception as e:
-        print(f"nextjs_post({path}) failed: {e}")
+        print(f"🗄️  Supabase (via Next.js): POST {path} -> failed: {e}")
         return 0
 
 
@@ -301,7 +313,7 @@ class RTPBridge:
             max_size=2**23,
         ) as ws:
             self.oa_ws = ws
-            await ws.send(json.dumps({
+            session_update_event = {
                 "type": "session.update",
                 "session": {
                     "type": "realtime",
@@ -328,7 +340,18 @@ class RTPBridge:
                     "instructions": instructions,
                     "tools": tools,
                 },
-            }))
+            }
+            # Full, untruncated dump of the exact payload sent to OpenAI Realtime — instructions,
+            # audio/voice config, and the complete tools list — so a human watching the terminal
+            # can see precisely what the model was configured with for this call.
+            print(
+                f"\n{'=' * 80}\n"
+                f"[{self.chan_id}] 📡 SESSION.UPDATE -> OpenAI Realtime\n"
+                f"{'=' * 80}\n"
+                f"{json.dumps(session_update_event, ensure_ascii=False, indent=2)}\n"
+                f"{'=' * 80}\n"
+            )
+            await ws.send(json.dumps(session_update_event))
             print(f"[{self.chan_id}] OpenAI session configured, waiting for events...")
             async for message in ws:
                 event = json.loads(message)
@@ -344,18 +367,24 @@ class RTPBridge:
                         pcmu = base64.b64decode(audio_b64)
                         self.enqueue_audio(pcmu)
                 elif etype == "response.done":
-                    print(f"[{self.chan_id}] response.done")
+                    self._log_function_calls(event)
                     self._extract_tool_result(event)
                     await self._handle_ask_client_question(event)
                 elif etype == "response.output_audio_transcript.done":
-                    self._record_transcript("ai", event.get("transcript", ""))
+                    text = event.get("transcript", "")
+                    self._record_transcript("ai", text)
+                    if text.strip():
+                        print(f"[{self.chan_id}] 🤖 AI: {text.strip()}")
                 elif etype == "conversation.item.input_audio_transcription.completed":
-                    self._record_transcript("user", event.get("transcript", ""))
+                    text = event.get("transcript", "")
+                    self._record_transcript("user", text)
+                    if text.strip():
+                        print(f"[{self.chan_id}] 👤 USER: {text.strip()}")
                 elif etype == "input_audio_buffer.speech_started":
-                    print(f"[{self.chan_id}] speech_started -> interrupting AI (barge-in)")
+                    print(f"[{self.chan_id}] 🎙️  user started speaking (barge-in, interrupting AI)")
                     self.out_buffer.clear()
                 elif etype == "error":
-                    print(f"[{self.chan_id}] OpenAI error: {event}")
+                    print(f"[{self.chan_id}] ❌ OpenAI error: {event}")
                 if not self.running:
                     break
 
@@ -371,6 +400,27 @@ class RTPBridge:
             "text": text,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         })
+
+    def _log_function_calls(self, response_done_event):
+        """Prints every function_call the model made in this response turn, with its arguments,
+        the moment the turn completes — so a human watching the terminal sees each tool
+        invocation (report_outcome, ask_client_question, report_confirmation_result) rather than
+        only the final derived outcome. Purely a logging pass; _extract_tool_result and
+        _handle_ask_client_question still do the actual handling below."""
+        try:
+            output = response_done_event.get("response", {}).get("output", [])
+            calls = [item for item in output if item.get("type") == "function_call"]
+            if not calls:
+                return
+            for item in calls:
+                name = item.get("name")
+                try:
+                    args = json.loads(item.get("arguments", "{}"))
+                except Exception:
+                    args = item.get("arguments")
+                print(f"[{self.chan_id}] 🔧 FUNCTION CALL: {name}({json.dumps(args, ensure_ascii=False)})")
+        except Exception as e:
+            print(f"[{self.chan_id}] error logging function calls: {e}")
 
     def _extract_tool_result(self, response_done_event):
         """Scan a response.done event's output items for a completed report_outcome function
@@ -388,7 +438,7 @@ class RTPBridge:
                     continue
                 args = json.loads(item.get("arguments", "{}"))
                 self.tool_result = args
-                print(f"[{self.chan_id}] {name} tool result: {args}")
+                print(f"[{self.chan_id}] ✅ {name} result: {json.dumps(args, ensure_ascii=False)}")
         except Exception as e:
             print(f"[{self.chan_id}] error extracting tool result: {e}")
 
@@ -409,14 +459,13 @@ class RTPBridge:
                 question = args.get("question", "").strip()
                 if not question:
                     continue
-                print(f"[{self.chan_id}] ask_client_question: {question} (attempt_id={self.attempt_id})")
+                print(f"[{self.chan_id}] 🔧 ask_client_question(question={question!r}, attempt_id={self.attempt_id})")
                 status = 0
                 if self.attempt_id:
                     status = nextjs_post(
                         "/api/orchestrator/ask-question",
                         {"attempt_id": self.attempt_id, "question": question},
                     )
-                print(f"[{self.chan_id}] ask-question forward -> Next.js status={status}")
                 ok = status in (200, 201)
                 await self.oa_ws.send(json.dumps({
                     "type": "conversation.item.create",
@@ -448,8 +497,14 @@ async def fetch_call_context(attempt_id):
     should still proceed with SOME reasonable behavior rather than crash outright."""
     status, body = nextjs_get(f"/api/orchestrator/call-context/{attempt_id}")
     if status == 200 and body.get("instructions"):
+        order = body.get("order", {})
+        candidate = body.get("candidate", {})
+        print(
+            f"[{attempt_id}] 📋 call context loaded from DB: order #{order.get('order_number')} "
+            f"({order.get('category')}) -> candidate {candidate.get('name')} ({candidate.get('type')})"
+        )
         return body["instructions"]
-    print(f"fetch_call_context({attempt_id}) failed (status={status}), using fallback instructions")
+    print(f"[{attempt_id}] ⚠️  fetch_call_context failed (status={status}), using fallback instructions")
     return (
         "You are mushebi.ge's voice assistant. Greet the person, ask if they're available "
         "to discuss a job opportunity, and call the report_outcome tool with 'needs_follow_up' "

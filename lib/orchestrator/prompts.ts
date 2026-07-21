@@ -16,7 +16,25 @@ interface BuildVoiceCallInstructionsParams {
   orderId: string;
   candidateName: string | null;
   language: string; // 'ru' | 'ka' | 'en'
+  /** call_candidates.id for this attempt — used to resolve role + driver subscription status */
+  candidateId?: string;
+  /** order_call_attempts.id — for log tagging only, does not affect any query */
+  attemptId?: string;
 }
+
+const MARKETPLACE_AGENT_SYSTEM_PROMPT = `Ты — интеллектуальный агент цифрового маркетплейса mushebi.ge.
+Твоя бизнес-модель: платформа зарабатывает на недельных подписках водителей (30 лари в неделю). Твоя цель — максимизировать ликвидность рынка и доводить каждую сделку до результата.
+
+ТВОИ ИНСТРУМЕНТЫ И СКИЛЫ:
+
+База данных (Supabase): Перед ответом любому пользователю проверяй его статус. Если это водитель — проверяй срок подписки. Если подписка истекла, не давай заказы, а предлагай продление.
+
+Мессенджеры (WhatsApp / Telegram): Веди диалог четко, по делу, без воды. Клиентам помогай зафиксировать параметры переезда и рассчитать цену. Водителям показывай доступные тендеры по их специализации.
+
+Голосовая связь (Asterisk): При сбоях или долгом молчании задействуй телефонный обзвон через оркестратор для подтверждения договоренностей.
+
+ПРАВИЛА ПОВЕДЕНИЯ:
+Никогда не выдумывай цены и статусы. Опирайся только на факты из базы данных. Если информации недостаточно, задавай прямой уточняющий вопрос.`;
 
 const TONE_BLOCK: Record<string, string> = {
   ka: (
@@ -85,10 +103,16 @@ const GREETING_INTRO: Record<string, (name: string) => string> = {
 export async function buildVoiceCallInstructions(
   params: BuildVoiceCallInstructionsParams
 ): Promise<string> {
-  const { orderId, candidateName, language } = params;
+  const { orderId, candidateName, language, candidateId, attemptId } = params;
   const lang = TONE_BLOCK[language] ? language : 'ru';
+  const logTag = `[voice-call][attemptId=${attemptId ?? 'n/a'}]`;
 
-  const [orderContext, orderRow] = await Promise.all([
+  console.log(
+    `🗄️  ${logTag} Supabase SELECT -> tender_orders.select("order_number, client_budget").eq("id", "${orderId}").single() ` +
+    `+ call_candidates.select("candidate_type, driver_id").eq("id", "${candidateId ?? 'n/a'}").single()`
+  );
+
+  const [orderContext, orderRow, candidateRow] = await Promise.all([
     buildOrderContext(orderId, 'driver', lang),
     supabaseAdmin
       .from('tender_orders')
@@ -96,21 +120,81 @@ export async function buildVoiceCallInstructions(
       .eq('id', orderId)
       .single()
       .then(r => r.data),
+    candidateId
+      ? supabaseAdmin
+          .from('call_candidates')
+          .select('candidate_type, driver_id')
+          .eq('id', candidateId)
+          .single()
+          .then(r => r.data)
+      : Promise.resolve(null),
   ]);
+
+  console.log(
+    `🗄️  ${logTag} Supabase RESULT -> tender_orders: ${JSON.stringify(orderRow)} | ` +
+    `call_candidates: ${JSON.stringify(candidateRow)}`
+  );
+
+  // Role + subscription status come straight from the DB — never guessed, per the
+  // marketplace-agent system prompt's "никогда не выдумывай статусы" rule.
+  let subscriptionLine = '';
+  if (candidateRow?.candidate_type === 'driver' && candidateRow.driver_id) {
+    console.log(
+      `🗄️  ${logTag} Supabase SELECT -> tender_drivers.select("name, subscription_expires_at").eq("id", "${candidateRow.driver_id}").single()`
+    );
+    const { data: driver } = await supabaseAdmin
+      .from('tender_drivers')
+      .select('name, subscription_expires_at')
+      .eq('id', candidateRow.driver_id)
+      .single();
+
+    const isActive = !!driver?.subscription_expires_at &&
+      new Date(driver.subscription_expires_at) > new Date();
+
+    console.log(
+      `🗄️  ${logTag} SUBSCRIPTION CHECK -> driver_id=${candidateRow.driver_id} name=${driver?.name ?? 'n/a'} ` +
+      `subscription_expires_at=${driver?.subscription_expires_at ?? 'null'} now=${new Date().toISOString()} ` +
+      `=> VERDICT: ${isActive ? 'ACTIVE' : 'EXPIRED'}`
+    );
+
+    subscriptionLine = isActive
+      ? {
+          ka: `მოსაუბრე არის ავტორიზებული შემსრულებელი აქტიური გამოწერით (მოქმედებს ${driver!.subscription_expires_at}-მდე).`,
+          en: `The person you're calling is a registered driver with an active subscription (valid until ${driver!.subscription_expires_at}).`,
+          ru: `Собеседник — зарегистрированный исполнитель с активной подпиской (действует до ${driver!.subscription_expires_at}).`,
+        }[lang] || ''
+      : {
+          ka: 'მოსაუბრეს ვადაგასული ან არარსებული გამოწერა აქვს — ნუ შესთავაზებ ახალ შეკვეთებს დეტალურად, ჯერ შესთავაზე გამოწერის განახლება.',
+          en: "The person you're calling has an expired or missing subscription — don't share order details yet, first offer to renew the subscription.",
+          ru: 'У собеседника истёкшая или отсутствующая подписка — не раскрывай детали заказа, сначала предложи продлить подписку.',
+        }[lang] || '';
+  } else if (candidateRow?.candidate_type === 'cold_contact') {
+    subscriptionLine = {
+      ka: 'მოსაუბრე ჯერ არ არის რეგისტრირებული შემსრულებელი (ცივი კონტაქტი) — არ ვარაუდობ გამოწერის სტატუსს.',
+      en: "The person you're calling is not yet a registered driver (cold contact) — no subscription status applies.",
+      ru: 'Собеседник ещё не зарегистрированный исполнитель (холодный контакт) — статус подписки не применим.',
+    }[lang] || '';
+    console.log(`🗄️  ${logTag} role=cold_contact (driver_id=null) -> no subscription check needed`);
+  }
 
   const roleIntro: Record<string, string> = {
     ka: (
       'შენ ხარ mushebi.ge-ს ხმოვანი ასისტენტი — საქართველოში საყოფაცხოვრებო ' +
       'მომსახურების შემსრულებლების საძიებო სერვისი. რეკავ პოტენციურ შემსრულებელს ' +
-      'ახალი შეკვეთის თაობაზე.'
+      'ახალი შეკვეთის თაობაზე. ეს ტენდერია: შენი ამოცანაა აღწერო შეკვეთა და ჰკითხო ' +
+      'შემსრულებელს, რა ფასად აიღებდა მას — ფასს ის ასახელებს, არა შენ.'
     ),
     en: (
       "You are mushebi.ge's voice assistant — a Georgian home-services marketplace. " +
-      'You are calling a potential service provider about a new order.'
+      "You are calling a potential service provider about a new order. This is a tender: " +
+      "your job is to describe the order and ask the provider what price they'd do it for " +
+      "— they name the price, not you."
     ),
     ru: (
       'Ты голосовой ассистент mushebi.ge — сервиса по поиску исполнителей для бытовых ' +
-      'услуг в Грузии. Ты звонишь потенциальному исполнителю по поводу нового заказа.'
+      'услуг в Грузии. Ты звонишь потенциальному исполнителю по поводу нового заказа. Это ' +
+      'тендер: твоя задача — описать заказ и спросить у исполнителя, за какую цену он ' +
+      'готов его взять. Цену называет он, а не ты.'
     ),
   };
 
@@ -122,11 +206,13 @@ export async function buildVoiceCallInstructions(
       }[lang]
     : '';
 
-  return [
+  const finalInstructions = [
+    MARKETPLACE_AGENT_SYSTEM_PROMPT,
     roleIntro[lang],
     TONE_BLOCK[lang],
     GREETING_INTRO[lang](candidateName ?? ''),
     orderRow?.order_number ? `Order #${orderRow.order_number}.` : '',
+    subscriptionLine,
     orderContext,
     budgetLine,
     driverPricingRules(lang),
@@ -135,4 +221,18 @@ export async function buildVoiceCallInstructions(
   ]
     .filter(Boolean)
     .join('\n\n');
+
+  // Full, untruncated dump of the exact system prompt sent to the Realtime session — deliberately
+  // NOT using a preview/slice here, per the debugging requirement to see the complete text
+  // (including every dynamic DB-sourced line: name, subscription verdict, order details) before
+  // it leaves this process.
+  console.log(
+    `\n${'='.repeat(80)}\n` +
+    `🗒️  ${logTag} FINAL SYSTEM PROMPT (lang=${lang})\n` +
+    `${'='.repeat(80)}\n` +
+    finalInstructions +
+    `\n${'='.repeat(80)}\n`
+  );
+
+  return finalInstructions;
 }
