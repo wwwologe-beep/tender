@@ -5,6 +5,7 @@ import { translateFaqAnswer } from '@/lib/ai';
 import { rebuildOrderFaq } from '@/lib/ai-advisor';
 import { refreshAllCards } from '@/lib/telegram/card';
 import { resolveClarificationAndRequeue } from '@/lib/orchestrator/clarification';
+import { logSystemEvent } from '@/lib/system-log';
 
 // POST /api/webhook/wappi
 // Wappi отправляет сюда входящие сообщения WhatsApp
@@ -18,6 +19,13 @@ export async function POST(req: NextRequest) {
     for (const msg of messages) {
       const text   = (msg.body ?? '').trim();
       const sender = (msg.author ?? msg.from ?? '').replace(/[^0-9]/g, '');
+
+      logSystemEvent({
+        source: 'webhook',
+        tag: 'wappi-webhook.incoming',
+        message: `Incoming WhatsApp message from ${sender}: "${text.slice(0, 200)}"`,
+        data: { sender, text, isReply: msg.isReply ?? false, quotedText: msg.reply_message?.body },
+      });
 
       // Ищем код вида msb_XXXXX
       const match = text.match(/msb_[A-Z0-9]{5}/i);

@@ -1,11 +1,20 @@
 import OpenAI from 'openai';
+import { logSystemEvent } from '@/lib/system-log';
 
 // Full, untruncated prompt/response dump for every text-agent call — same intent as the
 // existing dump in lib/orchestrator/prompts.ts (voice agent), so the whole multi-agent system
-// is traceable through one log format, not just the voice half.
+// is traceable through one log format, not just the voice half. Persisted to system_logs
+// (not just console) so it survives past Vercel's log retention window and can be pulled
+// locally for analysis (scripts/pull-logs.ts).
 function logAgentCall(agentTag: string, messages: unknown, responseContent: string | null | undefined) {
   console.log(`🤖 [${agentTag}] REQUEST -> ${JSON.stringify(messages)}`);
   console.log(`🤖 [${agentTag}] RESPONSE <- ${responseContent ?? '(empty)'}`);
+  logSystemEvent({
+    source: 'ai-agent',
+    tag: agentTag,
+    message: responseContent ?? '(empty)',
+    data: { messages, response: responseContent },
+  });
 }
 
 let _client: OpenAI | null = null;

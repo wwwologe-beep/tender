@@ -11,6 +11,7 @@
 import { buildOrderContext } from '@/lib/ai-advisor';
 import { driverPricingRules } from '@/lib/pricing-policy';
 import { supabaseAdmin } from '@/lib/supabase';
+import { logSystemEvent } from '@/lib/system-log';
 
 interface BuildVoiceCallInstructionsParams {
   orderId: string;
@@ -233,6 +234,14 @@ export async function buildVoiceCallInstructions(
     finalInstructions +
     `\n${'='.repeat(80)}\n`
   );
+
+  logSystemEvent({
+    source: 'voice-call',
+    tag: 'orchestrator.buildVoiceCallInstructions',
+    orderId,
+    message: `System prompt built for attemptId=${attemptId ?? 'n/a'}, candidate=${candidateName ?? 'unknown'}`,
+    data: { attemptId, candidateId, candidateName, language: lang, systemPrompt: finalInstructions },
+  });
 
   return finalInstructions;
 }

@@ -49,3 +49,6 @@ __pycache__/
 *.pyc
 
 .vercel
+
+# скачанные логи (scripts/pull-logs.ts) — локальные для анализа, не для репозитория
+/logs/

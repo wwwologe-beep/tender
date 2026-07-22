@@ -1,5 +1,6 @@
 import OpenAI from 'openai';
 import { supabaseAdmin } from '@/lib/supabase';
+import { logSystemEvent } from '@/lib/system-log';
 
 // ─── OpenRouter client ────────────────────────────────────────────────────────
 
@@ -16,10 +17,19 @@ function getClient() {
 
 // Full, untruncated prompt/response dump for every text-agent call — same intent as the
 // existing dump in lib/orchestrator/prompts.ts (voice agent), so the whole multi-agent system
-// is traceable through one log format, not just the voice half.
-function logAgentCall(agentTag: string, messages: unknown, responseContent: string | null | undefined) {
+// is traceable through one log format, not just the voice half. Persisted to system_logs
+// (not just console) so it survives past Vercel's log retention window and can be pulled
+// locally for analysis (scripts/pull-logs.ts).
+function logAgentCall(agentTag: string, messages: unknown, responseContent: string | null | undefined, orderId?: string) {
   console.log(`🤖 [${agentTag}] REQUEST -> ${JSON.stringify(messages)}`);
   console.log(`🤖 [${agentTag}] RESPONSE <- ${responseContent ?? '(empty)'}`);
+  logSystemEvent({
+    source: 'ai-agent',
+    tag: agentTag,
+    orderId,
+    message: responseContent ?? '(empty)',
+    data: { messages, response: responseContent },
+  });
 }
 
 // ─── Типы ────────────────────────────────────────────────────────────────────
@@ -297,7 +307,7 @@ export async function chatWithAdvisor(params: {
   });
 
   const rawReply = response.choices[0]?.message?.content;
-  logAgentCall(`ai-advisor.chatWithAdvisor(role=${role})`, messages, rawReply);
+  logAgentCall(`ai-advisor.chatWithAdvisor(role=${role})`, messages, rawReply, orderId);
   const reply = rawReply?.trim() ?? 'Не удалось получить ответ.';
 
   // 6. Сохраняем диалог (последние 20 сообщений)
@@ -369,7 +379,7 @@ export async function rebuildOrderFaq(orderId: string): Promise<void> {
   });
 
   const rebuildContent = response.choices[0]?.message?.content;
-  logAgentCall('ai-advisor.rebuildOrderFaq', rebuildMessages, rebuildContent);
+  logAgentCall('ai-advisor.rebuildOrderFaq', rebuildMessages, rebuildContent, orderId);
   try {
     const parsed = JSON.parse(rebuildContent ?? '{}');
     if (parsed.live_brief_ai) {

@@ -3,6 +3,7 @@ import { supabaseAdmin } from '@/lib/supabase';
 import { advanceToNextCandidate, succeedSequence } from '@/lib/orchestrator/sequence';
 import { originateNextAttempt } from '@/lib/orchestrator/tick';
 import { countInFlightCalls, MAX_CONCURRENT_CALLS } from '@/lib/orchestrator/concurrency';
+import { logSystemEvent } from '@/lib/system-log';
 
 type ToolOutcome = 'agreed' | 'declined' | 'needs_follow_up' | 'voicemail';
 
@@ -60,6 +61,14 @@ export async function POST(req: NextRequest) {
     `✅ [voice-call] outcome=${outcome} for attempt_id=${body.attempt_id} ` +
     `(tool_result=${JSON.stringify(body.tool_result)})`
   );
+
+  logSystemEvent({
+    source: 'voice-call',
+    tag: 'orchestrator.call-result',
+    orderId: attempt.order_id,
+    message: `Call outcome=${outcome} (attempt_id=${body.attempt_id}, duration=${body.call_duration_seconds ?? 'n/a'}s)`,
+    data: { outcome, tool_result: body.tool_result, transcript: body.transcript, hangup_cause: body.hangup_cause },
+  });
 
   await supabaseAdmin
     .from('order_call_attempts')
