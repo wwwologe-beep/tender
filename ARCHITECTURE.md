@@ -281,6 +281,13 @@ npx ts-node -r tsconfig-paths/register --project scripts/tsconfig.json scripts/t
 ```
 
 `scripts/diag.ts` — список исполнителей, кто получит уведомления, последние заказы.
+`scripts/simulate-voice-call.ts` — симулирует голосовой звонок текстом, без реального
+Asterisk/минут: строит настоящий `buildVoiceCallInstructions()`-промпт, прогоняет диалог
+между голосовым AI и второй LLM, играющей исполнителя по пресету (`reasonable`, `haggler`,
+`confused`, `vague_answer`, `rude_hangup`, `other_language`, `silent_then_price`). Дешёвый
+первый фильтр для проверки логики (правильные ли tool-calls, не путается ли AI) перед
+реальным звонком — не проверяет качество голоса/распознавания речи. Полный транскрипт в
+`system_logs` (`tag=simulate-voice-call`).
 `scripts/test-full-cycle.ts` — E2E 25 шагов текстового цикла (создание → вопрос → ответ →
 ставка → выбор). Не покрывает голосовой оркестратор — тот проверяется только живыми звонками.
 
