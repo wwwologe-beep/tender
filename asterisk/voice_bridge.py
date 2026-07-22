@@ -220,6 +220,33 @@ ASK_CLIENT_QUESTION_TOOL = {
     },
 }
 
+CREATE_ORDER_TOOL = {
+    "type": "function",
+    "name": "create_order",
+    "description": (
+        "Call this once you have gathered enough details about the job the caller wants done "
+        "(what needs to be done, and ideally the address and timing) to create a real order on "
+        "the platform. Always call this before ending the call if the caller wants a job done — "
+        "an inbound call that ends without calling this tool means the request is lost entirely, "
+        "so err on the side of calling it even if some details are still missing (missing details "
+        "can be clarified later by the drivers who respond)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "description": {
+                "type": "string",
+                "description": "Free-text summary of the job in Russian, as detailed as what the caller told you",
+            },
+            "address": {
+                "type": "string",
+                "description": "Address or area if mentioned, else omit",
+            },
+        },
+        "required": ["description"],
+    },
+}
+
 
 class RTPBridge:
     """Handles one call's RTP <-> OpenAI Realtime audio bridging."""
@@ -240,6 +267,8 @@ class RTPBridge:
         self.oa_ws = None
         self.out_buffer = bytearray()  # raw ulaw bytes pending transmission, paced by sender_loop
         self.tool_result = None  # populated by report_outcome tool call, if the model calls it
+        self.caller_phone = None  # set by caller after construction, needed for create_order (inbound calls)
+        self.created_order = None  # populated by create_order tool call, if the model calls it
         self.call_started_at = time.monotonic()
         self.attempt_id = None  # set by caller after construction, needed for ask_client_question
         self.transcript = []  # list of {role, text, timestamp}, built from transcription events
@@ -370,6 +399,7 @@ class RTPBridge:
                     self._log_function_calls(event)
                     self._extract_tool_result(event)
                     await self._handle_ask_client_question(event)
+                    await self._handle_create_order(event)
                 elif etype == "response.output_audio_transcript.done":
                     text = event.get("transcript", "")
                     self._record_transcript("ai", text)
@@ -483,6 +513,47 @@ class RTPBridge:
         except Exception as e:
             print(f"[{self.chan_id}] error handling ask_client_question: {e}")
 
+    async def _handle_create_order(self, response_done_event):
+        """Scan a response.done event for a completed create_order call (inbound calls only —
+        see ARCHITECTURE.md §7, this closes the biggest gap where an inbound call could have a
+        full conversation and nothing was ever saved). Requires self.caller_phone to have been
+        set from the ARI channel's caller number at StasisStart — without a real phone number
+        there's no way to identify the client afterwards, so the tool is refused in that case
+        rather than silently creating an order nobody can be reached about."""
+        try:
+            output = response_done_event.get("response", {}).get("output", [])
+            for item in output:
+                if item.get("type") != "function_call" or item.get("name") != "create_order":
+                    continue
+                call_id = item.get("call_id")
+                args = json.loads(item.get("arguments", "{}"))
+                description = args.get("description", "").strip()
+                address = args.get("address", "").strip() or None
+                if not description or not self.caller_phone:
+                    ok = False
+                    note = "Missing description or caller phone number, could not create the order."
+                else:
+                    print(f"[{self.chan_id}] 🔧 create_order(phone={self.caller_phone}, description={description!r})")
+                    status = nextjs_post(
+                        "/api/orchestrator/create-order-from-call",
+                        {"caller_phone": self.caller_phone, "description": description, "address": address},
+                    )
+                    ok = status in (200, 201)
+                    self.created_order = {"ok": ok}
+                    note = "Order created, drivers are being notified now." if ok \
+                        else "Failed to create the order, apologize and suggest they try again or use the website."
+                await self.oa_ws.send(json.dumps({
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": json.dumps({"created": ok, "note": note}),
+                    },
+                }))
+                await self.oa_ws.send(json.dumps({"type": "response.create"}))
+        except Exception as e:
+            print(f"[{self.chan_id}] error handling create_order: {e}")
+
     def stop(self):
         self.running = False
         try:
@@ -550,8 +621,8 @@ async def report_call_result(attempt_id, channel_id, bridge):
     print(f"[{channel_id}] reported call result -> Next.js status={status}")
 
 
-async def handle_call(chan_id, attempt_id=None, preset_instructions=None):
-    print(f"[{chan_id}] handling new call (attempt_id={attempt_id})")
+async def handle_call(chan_id, attempt_id=None, preset_instructions=None, caller_number=None):
+    print(f"[{chan_id}] handling new call (attempt_id={attempt_id}, caller_number={caller_number})")
     status, body = ari_request("POST", f"/channels/{chan_id}/answer")
     print(f"[{chan_id}] answer -> {status}")
 
@@ -589,6 +660,13 @@ async def handle_call(chan_id, attempt_id=None, preset_instructions=None):
     bridge.ari_bridge_id = bridge_id
     bridge.extmedia_id = extmedia_id
     bridge.attempt_id = attempt_id
+    bridge.caller_phone = caller_number
+
+    # Inbound calls (from [from-citynet] dialplan) never go through /originate, so they never
+    # get an attempt_id — this is exactly how we tell "someone called 2115325 directly" apart
+    # from "the orchestrator is calling a candidate/client". See ARCHITECTURE.md §7 — this used
+    # to be the biggest known gap: the call would happen but nothing was ever saved.
+    is_inbound_call = attempt_id is None and preset_instructions is None
 
     if preset_instructions:
         # Caller already built the full instructions text (e.g. a winner-confirmation call —
@@ -597,23 +675,33 @@ async def handle_call(chan_id, attempt_id=None, preset_instructions=None):
     elif attempt_id:
         instructions = await fetch_call_context(attempt_id)
     else:
-        # Manual/inbound test call with no orchestrator attempt attached — keep the
-        # original generic behavior so ad-hoc testing (per ARCHITECTURE.md §9) still works.
+        # Real inbound call to 2115325 — greet, gather enough details about the job, and
+        # create a real order via create_order before hanging up. Without this the entire
+        # conversation would just vanish (no tender_orders row, no notification to anyone).
         instructions = (
-            "You are mushebi.ge's voice assistant. Speak Russian. Greet the caller "
-            "naturally and ask how you can help."
+            "Ты голосовой ассистент mushebi.ge — сервиса поиска исполнителей для бытовых "
+            "услуг в Грузии. Тебе позвонил человек напрямую на номер платформы. Узнай, что "
+            "ему нужно (переезд, уборка, ремонт, разнорабочие и т.д.), уточни адрес и время, "
+            "если это возможно. Как только у тебя есть хотя бы суть задачи — обязательно "
+            "вызови функцию create_order, даже если не все детали известны (недостающее "
+            "уточнят откликнувшиеся исполнители). Если человек звонит не по поводу заказа "
+            "(вопрос, жалоба, ошибся номером) — веди себя естественно, не вызывай create_order "
+            "без необходимости. Честно скажи, что ты AI-ассистент, если спросят."
         )
 
     # Confirmation calls (winner told "you're selected", may back out) use a different, smaller
     # tool set than regular candidate-outreach calls — no ask_client_question (not appropriate
     # after a price is already agreed) and report_confirmation_result instead of report_outcome
-    # (confirmed/declined, not agreed/declined/needs_follow_up/voicemail).
+    # (confirmed/declined, not agreed/declined/needs_follow_up/voicemail). Inbound calls get
+    # create_order instead of report_outcome/ask_client_question — there's no candidate/price
+    # negotiation happening, just intake.
     is_confirmation_call = bool(attempt_id and attempt_id.startswith("confirm:"))
-    tools = (
-        [REPORT_CONFIRMATION_RESULT_TOOL]
-        if is_confirmation_call
-        else [REPORT_OUTCOME_TOOL, ASK_CLIENT_QUESTION_TOOL]
-    )
+    if is_confirmation_call:
+        tools = [REPORT_CONFIRMATION_RESULT_TOOL]
+    elif is_inbound_call:
+        tools = [CREATE_ORDER_TOOL]
+    else:
+        tools = [REPORT_OUTCOME_TOOL, ASK_CLIENT_QUESTION_TOOL]
 
     loop = asyncio.get_event_loop()
     recv_task = asyncio.create_task(bridge.rtp_recv_loop(loop))
@@ -708,7 +796,19 @@ async def main():
                 seen_channels.add(chan_id)
                 attempt_id = channel_to_attempt.get(chan_id)
                 preset_instructions = channel_to_instructions.pop(chan_id, None)
-                bridge, recv_task, send_task, oa_task = await handle_call(chan_id, attempt_id, preset_instructions)
+                # For a real inbound call, ARI's channel.caller.number carries the caller's
+                # phone number (E.164-ish, no leading +) — needed by create_order to identify
+                # the client afterwards. Empty for our own outbound-originated channels (the
+                # "caller" there is the platform, not a real person), which is fine since those
+                # paths don't use caller_number at all.
+                caller_number = channel.get("caller", {}).get("number") or None
+                # ARI gives the number without a leading "+" (e.g. "995599994875") — normalize
+                # to match how client_phone is stored everywhere else in tender_orders (with +).
+                if caller_number and not caller_number.startswith("+"):
+                    caller_number = "+" + caller_number
+                bridge, recv_task, send_task, oa_task = await handle_call(
+                    chan_id, attempt_id, preset_instructions, caller_number
+                )
                 active[chan_id] = (bridge, recv_task, send_task, oa_task)
             elif etype == "StasisEnd":
                 chan_id = event["channel"]["id"]
