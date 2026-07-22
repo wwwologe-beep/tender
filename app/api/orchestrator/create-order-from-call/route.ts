@@ -5,8 +5,6 @@ import { analyzeOrder, type LocalizedDescription } from '@/lib/ai';
 import { sendTenderToDrivers } from '@/lib/telegram/bot';
 import { buildCallCandidates } from '@/lib/orchestrator/matching';
 import { createCallSequence } from '@/lib/orchestrator/sequence';
-import { originateNextAttempt } from '@/lib/orchestrator/tick';
-import { countInFlightCalls, MAX_CONCURRENT_CALLS } from '@/lib/orchestrator/concurrency';
 import { logSystemEvent } from '@/lib/system-log';
 
 /**
@@ -94,7 +92,15 @@ export async function POST(req: NextRequest) {
 
   // Same fan-out as POST /api/tender/create: Telegram push to subscribed drivers, plus the
   // voice-orchestrator candidate queue for cold contacts — this order deserves the exact same
-  // outreach a web-submitted order gets, not a degraded version.
+  // outreach a web-submitted order gets, not a degraded version. Unlike the web form, this
+  // route deliberately does NOT originate the first call synchronously: this request is
+  // itself being called BY voice_bridge.py (from inside an active call), and voice_bridge.py's
+  // HTTP client is synchronous/blocking (urllib, not aiohttp) — an immediate originateCall()
+  // here would need that same process to handle a second /originate request while its event
+  // loop is still blocked waiting on THIS request, which reliably times out (confirmed via a
+  // live test call 2026-07-22: the order was created successfully but the caller heard "failed
+  // to create the order"). The first candidate call happens on the next cron/tick (~10 min)
+  // instead, same as it would if buildCallCandidates() found no in-flight capacity anyway.
   try {
     await sendTenderToDrivers(order.id);
   } catch (e) {
@@ -104,19 +110,7 @@ export async function POST(req: NextRequest) {
   try {
     const { built } = await buildCallCandidates(order.id);
     if (built > 0) {
-      const { sequenceId } = await createCallSequence(order.id);
-      if (sequenceId) {
-        const inFlight = await countInFlightCalls();
-        if (inFlight < MAX_CONCURRENT_CALLS) {
-          await originateNextAttempt({
-            id: sequenceId,
-            order_id: order.id,
-            current_position: 0,
-            candidate_count: built,
-            status: 'queued',
-          });
-        }
-      }
+      await createCallSequence(order.id);
     }
   } catch (e) {
     console.error('[create-order-from-call] buildCallCandidates', e);
