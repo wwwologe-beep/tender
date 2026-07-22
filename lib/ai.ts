@@ -228,6 +228,11 @@ Analyze the customer's order text. Return ONLY compact JSON, no prose.
 Category rules:
 - LOGISTICS (moving/transport/courier): needs cargo, origin, destination, scale.
 - SERVICE (cleaning/repair/electrician etc.): needs service type, destination address, scope.
+- If the job involves carrying/lifting furniture or heavy items by hand (movers/грузчики,
+  not just vehicle transport) — floor number and elevator availability are REQUIRED too,
+  since they directly change how many workers/how much time the job needs and how a driver
+  prices it. Flag as missing if neither is mentioned or inferable (e.g. "1st floor"/"частный
+  дом" implies no elevator needed, do NOT flag those).
 
 Pragmatic rules:
 - "2-room apartment", "one sofa", "office of 10 people" = scale known, do NOT flag.
