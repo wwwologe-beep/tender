@@ -14,6 +14,11 @@ import { sendPush } from '@/lib/push';
  * their voice question show up in /feed/[token]'s Q&A thread, not just as a push/WhatsApp
  * notification. The feed UI doesn't require driver identity to render a question (see
  * app/feed/[token]/page.tsx's questions section), so this needed no UI changes.
+ *
+ * Two ways to identify the order: the original `attempt_id` path (candidate-outreach calls,
+ * has a real order_call_attempts row) or the newer `order_id` + `driver_id` path (a driver
+ * calling in directly about their already-active order — see inbound-caller-context/route.ts
+ * — there's no attempt/candidate row for this, they're not being called, they called us).
  */
 export async function POST(req: NextRequest) {
   const authHeader = req.headers.get('authorization');
@@ -21,59 +26,81 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
 
-  const { attempt_id, question } = await req.json();
-  if (!attempt_id || !question?.trim()) {
-    return NextResponse.json({ error: 'attempt_id and question required' }, { status: 400 });
+  const { attempt_id, order_id, driver_id, question } = await req.json();
+  if ((!attempt_id && !order_id) || !question?.trim()) {
+    return NextResponse.json({ error: 'attempt_id (or order_id) and question required' }, { status: 400 });
   }
 
-  console.log(`🔧 [voice-call] ask_client_question(attempt_id=${attempt_id}, question=${JSON.stringify(question)})`);
+  console.log(`🔧 [voice-call] ask_client_question(attempt_id=${attempt_id ?? 'n/a'}, order_id=${order_id ?? 'n/a'}, question=${JSON.stringify(question)})`);
 
-  const { data: attempt } = await supabaseAdmin
-    .from('order_call_attempts')
-    .select('order_id, candidate_id')
-    .eq('id', attempt_id)
-    .single();
+  let resolvedOrderId: string;
+  let resolvedDriverId: string | null;
+  let candidateId: string | null = null;
+  let preferredLang: string | null = null;
 
-  if (!attempt) {
-    return NextResponse.json({ error: 'attempt not found' }, { status: 404 });
-  }
-
-  const [{ data: order }, { data: candidate }] = await Promise.all([
-    supabaseAdmin
-      .from('tender_orders')
-      .select('id, status, cargo_description, live_brief_ai, client_phone, push_subscription, token')
-      .eq('id', attempt.order_id)
-      .single(),
-    supabaseAdmin
+  if (attempt_id) {
+    const { data: attempt } = await supabaseAdmin
+      .from('order_call_attempts')
+      .select('order_id, candidate_id')
+      .eq('id', attempt_id)
+      .single();
+    if (!attempt) {
+      return NextResponse.json({ error: 'attempt not found' }, { status: 404 });
+    }
+    const { data: candidate } = await supabaseAdmin
       .from('call_candidates')
       .select('driver_id, preferred_lang')
       .eq('id', attempt.candidate_id)
-      .single(),
-  ]);
+      .single();
+    if (!candidate) {
+      return NextResponse.json({ error: 'candidate not found' }, { status: 404 });
+    }
+    resolvedOrderId = attempt.order_id;
+    resolvedDriverId = candidate.driver_id;
+    candidateId = attempt.candidate_id;
+    preferredLang = candidate.preferred_lang;
+  } else {
+    // Driver calling in directly about their active order — driver_language stands in for
+    // call_candidates.preferred_lang, since there's no candidate row for this path.
+    const { data: driver } = await supabaseAdmin
+      .from('tender_drivers')
+      .select('driver_language')
+      .eq('id', driver_id)
+      .single();
+    resolvedOrderId = order_id;
+    resolvedDriverId = driver_id ?? null;
+    preferredLang = driver?.driver_language ?? null;
+  }
+
+  const { data: order } = await supabaseAdmin
+    .from('tender_orders')
+    .select('id, status, cargo_description, live_brief_ai, client_phone, push_subscription, token')
+    .eq('id', resolvedOrderId)
+    .single();
 
   // Client Assistant state machine (see PROJECT.md): a driver's ask_client_question puts the
   // order "on pause" for clarification — client_bridge.py reads missing_info later to know what
   // to ask the client. Independent of the tender_orders.status bidding/selected/completed
   // lifecycle, so this write can't collide with it.
 
-  if (!order || !candidate) {
-    return NextResponse.json({ error: 'order or candidate not found' }, { status: 404 });
+  if (!order) {
+    return NextResponse.json({ error: 'order not found' }, { status: 404 });
   }
   if (!['bidding', 'selected'].includes(order.status)) {
     return NextResponse.json({ error: 'order closed' }, { status: 400 });
   }
 
-  const lang = (candidate.preferred_lang as 'ru' | 'ka' | 'en') || 'ru';
+  const lang = (preferredLang as 'ru' | 'ka' | 'en') || 'ru';
   const trimmedQuestion = question.trim();
   const context = order.live_brief_ai ?? order.cargo_description ?? '';
   const translated = await translateFaqEntry(trimmedQuestion, lang, context);
   const questionRu = translated?.ru ?? trimmedQuestion;
 
-  console.log(`🗄️  [voice-call] Supabase INSERT -> order_questions (order_id=${order.id}, driver_id=${candidate.driver_id ?? 'null'})`);
+  console.log(`🗄️  [voice-call] Supabase INSERT -> order_questions (order_id=${order.id}, driver_id=${resolvedDriverId ?? 'null'})`);
   await supabaseAdmin.from('order_questions').insert({
     order_id: order.id,
-    driver_id: candidate.driver_id, // null for cold_contact callers — allowed since 20260720
-    candidate_id: attempt.candidate_id, // so we know who to call back once the client answers
+    driver_id: resolvedDriverId, // null for cold_contact callers — allowed since 20260720
+    candidate_id: candidateId, // so we know who to call back once the client answers (attempt_id path only)
     question_original: trimmedQuestion,
     question_lang: lang,
     question_translated: translated,

@@ -269,6 +269,8 @@ class RTPBridge:
         self.tool_result = None  # populated by report_outcome tool call, if the model calls it
         self.caller_phone = None  # set by caller after construction, needed for create_order (inbound calls)
         self.created_order = None  # populated by create_order tool call, if the model calls it
+        self.driver_order_id = None  # set for an inbound call from a known driver with an active order
+        self.driver_id = None  # set alongside driver_order_id, needed for ask_client_question's driver_id path
         self.call_started_at = time.monotonic()
         self.attempt_id = None  # set by caller after construction, needed for ask_client_question
         self.transcript = []  # list of {role, text, timestamp}, built from transcription events
@@ -489,12 +491,20 @@ class RTPBridge:
                 question = args.get("question", "").strip()
                 if not question:
                     continue
-                print(f"[{self.chan_id}] 🔧 ask_client_question(question={question!r}, attempt_id={self.attempt_id})")
+                print(f"[{self.chan_id}] 🔧 ask_client_question(question={question!r}, attempt_id={self.attempt_id}, driver_order_id={self.driver_order_id})")
                 status = 0
                 if self.attempt_id:
                     status = nextjs_post(
                         "/api/orchestrator/ask-question",
                         {"attempt_id": self.attempt_id, "question": question},
+                    )
+                elif self.driver_order_id:
+                    # Driver calling in directly about their own active order — no
+                    # order_call_attempts row exists for this call, identify by order_id +
+                    # driver_id instead (see inbound-caller-context/route.ts).
+                    status = nextjs_post(
+                        "/api/orchestrator/ask-question",
+                        {"order_id": self.driver_order_id, "driver_id": self.driver_id, "question": question},
                     )
                 ok = status in (200, 201)
                 await self.oa_ws.send(json.dumps({
@@ -583,6 +593,25 @@ async def fetch_call_context(attempt_id):
     )
 
 
+async def fetch_inbound_caller_context(caller_number):
+    """GET /api/orchestrator/inbound-caller-context?phone=... at the start of every real
+    inbound call to 2115325 — before picking a system prompt/tool set, we need to know if
+    this is a known driver (who might be calling about their own active order, not placing a
+    new one) or an unknown caller who should be treated as a potential client. Returns a dict
+    with at least {'role': 'unknown'|'driver'} — 'unknown' (including on fetch failure) falls
+    back to the existing client-intake behavior, since that's the safer default (a driver
+    mistakenly asked "what job do you need done?" is a minor annoyance; a real client
+    mistakenly given a driver-support script and never asked about their job is a lost lead)."""
+    if not caller_number:
+        return {"role": "unknown"}
+    status, body = nextjs_get(f"/api/orchestrator/inbound-caller-context?phone={caller_number}")
+    if status == 200 and body.get("role"):
+        print(f"[inbound] caller {caller_number} identified as role={body['role']}, has_active_order={body.get('has_active_order')}")
+        return body
+    print(f"[inbound] ⚠️  fetch_inbound_caller_context failed (status={status}) for {caller_number}, treating as unknown/client")
+    return {"role": "unknown"}
+
+
 async def report_confirmation_result(attempt_id, bridge):
     """POST /api/orchestrator/confirmation-result on StasisEnd for a winner-confirmation call
     (synthetic 'confirm:<bidId>' attempt_id). If the model never called
@@ -668,6 +697,8 @@ async def handle_call(chan_id, attempt_id=None, preset_instructions=None, caller
     # to be the biggest known gap: the call would happen but nothing was ever saved.
     is_inbound_call = attempt_id is None and preset_instructions is None
 
+    is_inbound_driver_with_order = False
+
     if preset_instructions:
         # Caller already built the full instructions text (e.g. a winner-confirmation call —
         # see handle_originate's "confirmation" kind) — skip the call-context round trip.
@@ -675,29 +706,57 @@ async def handle_call(chan_id, attempt_id=None, preset_instructions=None, caller
     elif attempt_id:
         instructions = await fetch_call_context(attempt_id)
     else:
-        # Real inbound call to 2115325 — greet, gather enough details about the job, and
-        # create a real order via create_order before hanging up. Without this the entire
-        # conversation would just vanish (no tender_orders row, no notification to anyone).
-        instructions = (
-            "Ты голосовой ассистент mushebi.ge — сервиса поиска исполнителей для бытовых "
-            "услуг в Грузии. Тебе позвонил человек напрямую на номер платформы. Узнай, что "
-            "ему нужно (переезд, уборка, ремонт, разнорабочие и т.д.), уточни адрес и время, "
-            "если это возможно. Как только у тебя есть хотя бы суть задачи — обязательно "
-            "вызови функцию create_order, даже если не все детали известны (недостающее "
-            "уточнят откликнувшиеся исполнители). Если человек звонит не по поводу заказа "
-            "(вопрос, жалоба, ошибся номером) — веди себя естественно, не вызывай create_order "
-            "без необходимости. Честно скажи, что ты AI-ассистент, если спросят."
-        )
+        # Real inbound call to 2115325 — first find out WHO is calling. A known driver
+        # calling in isn't placing a new order, they might have a question about their own
+        # active job — treating everyone as client intake meant a driver would just get asked
+        # "what job do you need done?", which makes no sense. Unknown callers (including
+        # drivers with no active order right now) fall back to client intake, since they may
+        # still want to place an order themselves.
+        caller_ctx = await fetch_inbound_caller_context(caller_number)
+        if caller_ctx.get("role") == "driver" and caller_ctx.get("has_active_order"):
+            is_inbound_driver_with_order = True
+            bridge.driver_order_id = caller_ctx.get("active_order_id")
+            bridge.driver_id = caller_ctx.get("driver_id")
+            driver_lang = caller_ctx.get("driver_language") or "ru"
+            instructions = (
+                "Ты голосовой ассистент mushebi.ge. Тебе позвонил "
+                f"{caller_ctx.get('driver_name') or 'исполнитель'} — зарегистрированный "
+                "исполнитель платформы с активным заказом. Узнай, что его интересует по "
+                "этому заказу.\n\n=== Контекст активного заказа ===\n"
+                f"{caller_ctx.get('order_context', '')}\n\n"
+                "Если у него есть вопрос об заказе, на который нет ответа в контексте выше "
+                "— вызови функцию ask_client_question с этим вопросом. Ответ придёт не "
+                "сразу, скажи ему об этом. Если вопросов нет и всё понятно — просто "
+                "заверши разговор естественно."
+            )
+        else:
+            # Real inbound call, treated as a potential client — gather enough details about
+            # the job and create a real order via create_order before hanging up. Without this
+            # the entire conversation would just vanish (no tender_orders row, no notification
+            # to anyone) — this used to be the biggest known gap, see ARCHITECTURE.md §7.
+            instructions = (
+                "Ты голосовой ассистент mushebi.ge — сервиса поиска исполнителей для бытовых "
+                "услуг в Грузии. Тебе позвонил человек напрямую на номер платформы. Узнай, что "
+                "ему нужно (переезд, уборка, ремонт, разнорабочие и т.д.), уточни адрес и время, "
+                "если это возможно. Как только у тебя есть хотя бы суть задачи — обязательно "
+                "вызови функцию create_order, даже если не все детали известны (недостающее "
+                "уточнят откликнувшиеся исполнители). Если человек звонит не по поводу заказа "
+                "(вопрос, жалоба, ошибся номером) — веди себя естественно, не вызывай create_order "
+                "без необходимости. Честно скажи, что ты AI-ассистент, если спросят."
+            )
 
     # Confirmation calls (winner told "you're selected", may back out) use a different, smaller
     # tool set than regular candidate-outreach calls — no ask_client_question (not appropriate
     # after a price is already agreed) and report_confirmation_result instead of report_outcome
-    # (confirmed/declined, not agreed/declined/needs_follow_up/voicemail). Inbound calls get
-    # create_order instead of report_outcome/ask_client_question — there's no candidate/price
-    # negotiation happening, just intake.
+    # (confirmed/declined, not agreed/declined/needs_follow_up/voicemail). A driver calling in
+    # about their active order gets ask_client_question only (no report_outcome — there's no
+    # price negotiation to report). Everyone else inbound (treated as a potential client) gets
+    # create_order instead — there's no candidate/price negotiation happening, just intake.
     is_confirmation_call = bool(attempt_id and attempt_id.startswith("confirm:"))
     if is_confirmation_call:
         tools = [REPORT_CONFIRMATION_RESULT_TOOL]
+    elif is_inbound_driver_with_order:
+        tools = [ASK_CLIENT_QUESTION_TOOL]
     elif is_inbound_call:
         tools = [CREATE_ORDER_TOOL]
     else:
