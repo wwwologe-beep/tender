@@ -17,37 +17,61 @@
  */
 
 import { supabaseAdmin } from '@/lib/supabase';
+import { buildOrderContext } from '@/lib/ai-advisor';
 import { originateCall } from './bridge-client';
 
 const TRUNK_CALLER_ID = process.env.ORCHESTRATOR_CALLER_ID ?? '';
 
+// {order_context} is the same full order-facts block the initial outreach call gets (see
+// buildVoiceCallInstructions in prompts.ts) — without it, the agent can only echo the
+// client's literal answer text verbatim. If the client answers with a reference rather than
+// a fact ("it's in the order" instead of a time), an echo-only agent repeats that reference
+// back to the driver instead of resolving it against the actual order data it already has
+// (e.g. the time was already on the order, just not surfaced) — confirmed as a real bug via
+// live test 2026-07-22 (order #156: client answered "я же указал в заявке", agent parroted
+// that exact phrase to the driver instead of reading the actual time off the order).
 const ANSWER_INTRO: Record<string, string> = {
   ka: (
     'შენ ხარ mushebi.ge-ს ხმოვანი ასისტენტი. რეკავ შემსრულებელს, რომელმაც ადრე ' +
-    'დაგისვა კითხვა კონკრეტულ შეკვეთაზე. კლიენტმა უპასუხა — გადაეცი პასუხი მოკლედ ' +
-    'და ნათლად: "{question}" — "{answer}". თუ ეს ცვლის ფასს ან ვადებს, განაგრძე ' +
-    'საუბარი ჩვეულებრივად და მოძებნე შეთანხმება, ისევე როგორც ჩვეულებრივ ' +
-    'შეთავაზების ზარზე. საუბრის ბოლოს აუცილებლად გამოიძახე report_outcome.'
+    'დაგისვა კითხვა კონკრეტულ შეკვეთაზე. კლიენტმა უპასუხა კითხვაზე: "{question}" — ' +
+    'პასუხი: "{answer}".\n\n=== შეკვეთის სრული კონტექსტი ===\n{order_context}\n\n' +
+    'თუ კლიენტის პასუხი პირდაპირი არ არის (მაგ. "ეს უკვე მითითებულია შეკვეთაში" ' +
+    'პასუხის ნაცვლად კონკრეტული ფაქტისა) — თვითონ მოძებნე რეალური ინფორმაცია ზემოთ ' +
+    'მოცემულ შეკვეთის კონტექსტში და უთხარი შემსრულებელს კონკრეტული პასუხი, ნუ გაიმეორებ ' +
+    'კლიენტის ფრაზას სიტყვასიტყვით. გადაეცი პასუხი მოკლედ და ნათლად. თუ ეს ცვლის ფასს ' +
+    'ან ვადებს, განაგრძე საუბარი ჩვეულებრივად და მოძებნე შეთანხმება, ისევე როგორც ' +
+    'ჩვეულებრივ შეთავაზების ზარზე. საუბრის ბოლოს აუცილებლად გამოიძახე report_outcome.'
   ),
   en: (
     "You are mushebi.ge's voice assistant. You are calling back a service provider who " +
-    'earlier asked a question about a specific order. The client has now answered — relay ' +
-    'the answer briefly and clearly: "{question}" — "{answer}". If this changes the price ' +
-    'or timing, continue the conversation normally and try to reach an agreement, just like ' +
-    'a regular outreach call. Always call report_outcome at the end of the conversation.'
+    'earlier asked a question about a specific order: "{question}" — the client\'s answer ' +
+    'was: "{answer}".\n\n=== Full order context ===\n{order_context}\n\n' +
+    "If the client's answer is not a direct fact (e.g. \"it's already in the order\" instead " +
+    'of an actual value) — look up the real information yourself in the order context above ' +
+    "and tell the driver the concrete answer, don't just repeat the client's phrase verbatim. " +
+    'Relay the answer briefly and clearly. If this changes the price or timing, continue the ' +
+    'conversation normally and try to reach an agreement, just like a regular outreach call. ' +
+    'Always call report_outcome at the end of the conversation.'
   ),
   ru: (
     'Ты голосовой ассистент mushebi.ge. Перезваниваешь исполнителю, который ранее задал ' +
-    'вопрос по конкретному заказу. Клиент ответил — передай ответ коротко и понятно: ' +
-    '"{question}" — "{answer}". Если это меняет цену или сроки, продолжай разговор как ' +
+    'вопрос по конкретному заказу: "{question}" — клиент ответил: "{answer}".\n\n' +
+    '=== Полный контекст заказа ===\n{order_context}\n\n' +
+    'Если ответ клиента не является прямым фактом (например, "это уже указано в заявке" ' +
+    'вместо конкретного значения) — сам найди реальную информацию в контексте заказа выше ' +
+    'и назови исполнителю конкретный ответ, не повторяй фразу клиента дословно. Передай ' +
+    'ответ коротко и понятно. Если это меняет цену или сроки, продолжай разговор как ' +
     'обычно и постарайся договориться, как на обычном звонке-предложении. В конце ' +
     'разговора обязательно вызови report_outcome.'
   ),
 };
 
-function buildAnswerInstructions(question: string, answer: string, lang: string): string {
+function buildAnswerInstructions(question: string, answer: string, orderContext: string, lang: string): string {
   const template = ANSWER_INTRO[lang] ?? ANSWER_INTRO.ru;
-  return template.replace('{question}', question).replace('{answer}', answer);
+  return template
+    .replace('{question}', question)
+    .replace('{answer}', answer)
+    .replace('{order_context}', orderContext);
 }
 
 interface CallBackParams {
@@ -107,7 +131,8 @@ export async function callBackWithAnswer(params: CallBackParams): Promise<void> 
   }
 
   const lang = candidate.preferred_lang || 'ru';
-  const instructions = buildAnswerInstructions(params.question, params.answer, lang);
+  const orderContext = await buildOrderContext(question.order_id, 'driver', lang);
+  const instructions = buildAnswerInstructions(params.question, params.answer, orderContext, lang);
 
   const result = await originateCall({
     attemptId: attempt.id,
