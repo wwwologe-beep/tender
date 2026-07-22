@@ -207,6 +207,35 @@ export async function buildVoiceCallInstructions(
       }[lang]
     : '';
 
+  // Both fixes below found via scripts/simulate-voice-call.ts (2026-07-22), not a live call:
+  // (1) without an explicit "today's date" anchor, the model has no way to resolve "завтра"/
+  // "tomorrow" into a real ISO date for the available_date tool argument and fabricates one
+  // (observed: it produced a 2023 date) — silent_then_price persona caught this.
+  // (2) without an explicit turn cap, a candidate who keeps asking new questions can extend
+  // the call indefinitely with the model never calling report_outcome at all — confused
+  // persona ran 8 full turns with zero tool call. Both are logic bugs the text simulator
+  // surfaces cheaply; a real phone call wouldn't have made either failure mode obvious.
+  const todayLine = {
+    ka: `დღევანდელი თარიღია ${new Date().toISOString().slice(0, 10)}. თუ თარიღს/დროს ("ხვალ", "შემდეგ კვირას") ახსენებ report_outcome ფუნქციაში, გამოთვალე რეალური თარიღი ამის მიხედვით — არასდროს გამოიგონო თარიღი.`,
+    en: `Today's date is ${new Date().toISOString().slice(0, 10)}. If you mention a date/time ("tomorrow", "next week") in the report_outcome function, compute the real date from this — never fabricate a date.`,
+    ru: `Сегодняшняя дата: ${new Date().toISOString().slice(0, 10)}. Если упоминаешь дату/время ("завтра", "на следующей неделе") в функции report_outcome — вычисляй реальную дату от этой, никогда не выдумывай дату.`,
+  }[lang];
+
+  const turnLimitLine = {
+    ka: 'თუ შემსრულებელი განაგრძობს ახალი კითხვების დასმას და ვერ ასახელებს ფასს რამდენიმე ' +
+      'გაცვლის შემდეგ — არ განაგრძო დაუსრულებლად. თავაზიანად შეაჯამე, რომ დეტალები გადაეცემა ' +
+      'კლიენტს და აუცილებლად გამოიძახე report_outcome (needs_follow_up), ნუ დატოვებ ზარს ' +
+      'ინსტრუმენტის გამოძახების გარეშე.',
+    en: 'If the candidate keeps asking new questions and never names a price after several ' +
+      "exchanges — don't let the call drag on indefinitely. Politely wrap up, say the details " +
+      'will be forwarded, and always call report_outcome (needs_follow_up) — never end the ' +
+      'call without calling the tool.',
+    ru: 'Если исполнитель продолжает задавать новые вопросы и не называет цену после ' +
+      'нескольких обменов репликами — не затягивай разговор бесконечно. Вежливо подведи итог, ' +
+      'что детали передашь клиенту, и обязательно вызови report_outcome (needs_follow_up) — ' +
+      'никогда не заканчивай звонок без вызова этой функции.',
+  }[lang];
+
   const finalInstructions = [
     MARKETPLACE_AGENT_SYSTEM_PROMPT,
     roleIntro[lang],
@@ -216,8 +245,10 @@ export async function buildVoiceCallInstructions(
     subscriptionLine,
     orderContext,
     budgetLine,
+    todayLine,
     driverPricingRules(lang),
     ASK_QUESTION_INSTRUCTION[lang],
+    turnLimitLine,
     TOOL_INSTRUCTION[lang],
   ]
     .filter(Boolean)
