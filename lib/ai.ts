@@ -1,5 +1,13 @@
 import OpenAI from 'openai';
 
+// Full, untruncated prompt/response dump for every text-agent call — same intent as the
+// existing dump in lib/orchestrator/prompts.ts (voice agent), so the whole multi-agent system
+// is traceable through one log format, not just the voice half.
+function logAgentCall(agentTag: string, messages: unknown, responseContent: string | null | undefined) {
+  console.log(`🤖 [${agentTag}] REQUEST -> ${JSON.stringify(messages)}`);
+  console.log(`🤖 [${agentTag}] RESPONSE <- ${responseContent ?? '(empty)'}`);
+}
+
 let _client: OpenAI | null = null;
 function getClient(): OpenAI {
   if (!_client) {
@@ -45,13 +53,9 @@ const CATEGORIES = [
 
 export async function analyzeOrder(rawText: string): Promise<AiOrderAnalysis | null> {
   try {
-    const response = await getClient().chat.completions.create({
-      model: 'google/gemini-2.5-flash',
-      temperature: 0.2,
-      response_format: { type: 'json_object' },
-      messages: [
+    const messages = [
         {
-          role: 'system',
+          role: 'system' as const,
           content: `You are a multilingual order processing assistant for a Georgian services marketplace.
 Analyze the customer's service request and return a JSON object with this exact structure:
 {
@@ -73,13 +77,19 @@ boxes, home appliances, or unloading/loading such items MUST be classified as "m
 "general". Use "general" only when no other category clearly applies.`,
         },
         {
-          role: 'user',
+          role: 'user' as const,
           content: rawText,
         },
-      ],
+    ];
+    const response = await getClient().chat.completions.create({
+      model: 'google/gemini-2.5-flash',
+      temperature: 0.2,
+      response_format: { type: 'json_object' },
+      messages,
     });
 
     const content = response.choices[0]?.message?.content;
+    logAgentCall('ai.analyzeOrder', messages, content);
     if (!content) return null;
     return JSON.parse(content) as AiOrderAnalysis;
   } catch (err) {
@@ -96,13 +106,9 @@ export async function translateFaqEntry(
   existingContext: string,
 ): Promise<LocalizedDescription | null> {
   try {
-    const response = await getClient().chat.completions.create({
-      model: 'google/gemini-2.5-flash',
-      temperature: 0.1,
-      response_format: { type: 'json_object' },
-      messages: [
+    const messages = [
         {
-          role: 'system',
+          role: 'system' as const,
           content: `You are a translation assistant for a services marketplace.
 Translate the question to all three languages and return JSON:
 { "ru": "...", "ka": "...", "en": "..." }
@@ -110,13 +116,19 @@ Context about the order: ${existingContext}
 Keep questions natural and concise. Georgian must use Georgian script.`,
         },
         {
-          role: 'user',
+          role: 'user' as const,
           content: `Question in ${questionLang}: "${questionText}"`,
         },
-      ],
+    ];
+    const response = await getClient().chat.completions.create({
+      model: 'google/gemini-2.5-flash',
+      temperature: 0.1,
+      response_format: { type: 'json_object' },
+      messages,
     });
 
     const content = response.choices[0]?.message?.content;
+    logAgentCall('ai.translateFaqEntry', messages, content);
     if (!content) return null;
     return JSON.parse(content) as LocalizedDescription;
   } catch (err) {
@@ -130,21 +142,23 @@ export async function translateFaqAnswer(
   answerLang: 'ru' | 'ka' | 'en',
 ): Promise<LocalizedDescription | null> {
   try {
+    const messages = [
+        {
+          role: 'system' as const,
+          content: `Translate this answer to all three languages. Return JSON: { "ru": "...", "ka": "...", "en": "..." }
+Georgian must use Georgian script. Keep it natural.`,
+        },
+        { role: 'user' as const, content: `Answer in ${answerLang}: "${answerText}"` },
+    ];
     const response = await getClient().chat.completions.create({
       model: 'google/gemini-2.5-flash',
       temperature: 0.1,
       response_format: { type: 'json_object' },
-      messages: [
-        {
-          role: 'system',
-          content: `Translate this answer to all three languages. Return JSON: { "ru": "...", "ka": "...", "en": "..." }
-Georgian must use Georgian script. Keep it natural.`,
-        },
-        { role: 'user', content: `Answer in ${answerLang}: "${answerText}"` },
-      ],
+      messages,
     });
 
     const content = response.choices[0]?.message?.content;
+    logAgentCall('ai.translateFaqAnswer', messages, content);
     if (!content) return null;
     return JSON.parse(content) as LocalizedDescription;
   } catch (err) {
@@ -162,18 +176,21 @@ export async function translateChatMessage(
 ): Promise<string> {
   if (fromLang === toLang) return text;
   try {
+    const messages = [
+        {
+          role: 'system' as const,
+          content: `You are a translator for a home services marketplace chat. Translate the message naturally and concisely. Return only the translated text, nothing else. Target language: ${toLang === 'ka' ? 'Georgian (Georgian script)' : toLang === 'ru' ? 'Russian' : 'English'}.`,
+        },
+        { role: 'user' as const, content: text },
+    ];
     const response = await getClient().chat.completions.create({
       model: 'google/gemini-2.5-flash',
       temperature: 0.1,
-      messages: [
-        {
-          role: 'system',
-          content: `You are a translator for a home services marketplace chat. Translate the message naturally and concisely. Return only the translated text, nothing else. Target language: ${toLang === 'ka' ? 'Georgian (Georgian script)' : toLang === 'ru' ? 'Russian' : 'English'}.`,
-        },
-        { role: 'user', content: text },
-      ],
+      messages,
     });
-    return response.choices[0]?.message?.content?.trim() ?? text;
+    const content = response.choices[0]?.message?.content;
+    logAgentCall('ai.translateChatMessage', messages, content);
+    return content?.trim() ?? text;
   } catch {
     return text; // fallback — оригинал если перевод не удался
   }
@@ -193,14 +210,9 @@ export interface CompletenessCheck {
 
 export async function validateOrderCompleteness(rawText: string): Promise<CompletenessCheck> {
   try {
-    const response = await getClient().chat.completions.create({
-      model: 'google/gemini-2.5-flash',
-      temperature: 0,
-      max_tokens: 400,
-      response_format: { type: 'json_object' },
-      messages: [
+    const messages = [
         {
-          role: 'system',
+          role: 'system' as const,
           content: `You are a logistics order validator for a Georgian marketplace.
 Analyze the customer's order text. Return ONLY compact JSON, no prose.
 
@@ -217,11 +229,18 @@ Pragmatic rules:
 Return this JSON (keep questions short, max 10 words each, in customer's language):
 {"detected_lang":"ru|ka|en","missing":[],"questions":[]}`,
         },
-        { role: 'user', content: rawText },
-      ],
+        { role: 'user' as const, content: rawText },
+    ];
+    const response = await getClient().chat.completions.create({
+      model: 'google/gemini-2.5-flash',
+      temperature: 0,
+      max_tokens: 400,
+      response_format: { type: 'json_object' },
+      messages,
     });
 
     const content = response.choices[0]?.message?.content;
+    logAgentCall('ai.validateOrderCompleteness', messages, content);
     if (!content) return { status: 'ok', detected_lang: 'ru', missing: [], questions: [] };
 
     // Gemini иногда обрезает JSON на длинных кириллических строках — парсим безопасно
@@ -269,24 +288,27 @@ export async function generateWhatsAppGreeting(
   targetLang: 'ru' | 'ka' | 'en',
 ): Promise<string> {
   try {
-    const response = await getClient().chat.completions.create({
-      model: 'google/gemini-2.5-flash',
-      temperature: 0.3,
-      messages: [
+    const messages = [
         {
-          role: 'system',
+          role: 'system' as const,
           content: `Generate a short, friendly WhatsApp greeting message in ${targetLang} language for a service executor contacting a client.
 The message should say they were selected for the job and briefly mention the task.
 Return only the message text, nothing else. Max 2 sentences.`,
         },
         {
-          role: 'user',
+          role: 'user' as const,
           content: `Order #${orderId.slice(0, 8).toUpperCase()}: ${orderDescription}`,
         },
-      ],
+    ];
+    const response = await getClient().chat.completions.create({
+      model: 'google/gemini-2.5-flash',
+      temperature: 0.3,
+      messages,
     });
 
-    return response.choices[0]?.message?.content?.trim() ?? '';
+    const content = response.choices[0]?.message?.content;
+    logAgentCall('ai.generateWhatsAppGreeting', messages, content);
+    return content?.trim() ?? '';
   } catch {
     return '';
   }

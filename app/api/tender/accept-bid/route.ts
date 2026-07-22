@@ -75,6 +75,7 @@ export async function POST(req: NextRequest) {
       bidId: bid_id,
       driverId: winBid.driver_id,
       amount: winBid.amount ?? 0,
+      clientPhone: order.client_phone ?? null,
     }).catch(() => {});
 
     // Берём все ставки с данными исполнителей

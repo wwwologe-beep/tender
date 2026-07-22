@@ -32,8 +32,14 @@ export async function POST(req: NextRequest) {
   }
 
   if (outcome !== 'declined') {
-    // 'confirmed' (or any other/missing outcome, per voice_bridge.py's conservative default)
-    // requires no action — the order stays 'selected' as accept-bid already left it.
+    // 'confirmed' (or any other/missing outcome, per voice_bridge.py's conservative default):
+    // the order stays 'selected' as accept-bid already left it. Additionally, for winners
+    // with no Telegram (cold-contact-derived drivers), send the client's contact via
+    // WhatsApp as a durable backup to the spoken number already given during the call
+    // (see lib/orchestrator/confirmation-call.ts) — voice is easy to mishear/forget.
+    await sendClientContactWhatsApp(bidId, orderId).catch(err =>
+      console.error('[confirmation-result] sendClientContactWhatsApp failed', err)
+    );
     return NextResponse.json({ ok: true });
   }
 
@@ -71,4 +77,46 @@ export async function POST(req: NextRequest) {
   }
 
   return NextResponse.json({ ok: true, reverted: true });
+}
+
+async function sendClientContactWhatsApp(bidId: string, orderId: string): Promise<void> {
+  const { data: bid } = await supabaseAdmin
+    .from('tender_bids')
+    .select('driver_id')
+    .eq('id', bidId)
+    .single();
+  if (!bid?.driver_id) return;
+
+  const { data: driver } = await supabaseAdmin
+    .from('tender_drivers')
+    .select('phone, telegram_id, driver_language')
+    .eq('id', bid.driver_id)
+    .single();
+  // Telegram drivers already have client contact via the bot's "Запросить номер клиента"
+  // button — this WhatsApp fallback exists only for phone-only (cold-contact) winners.
+  if (!driver?.phone || driver.telegram_id) return;
+
+  const { data: order } = await supabaseAdmin
+    .from('tender_orders')
+    .select('client_phone, order_number')
+    .eq('id', orderId)
+    .single();
+  if (!order?.client_phone) return;
+
+  const wappiToken = process.env.WAPPI_TOKEN;
+  const wappiProfile = process.env.WAPPI_PROFILE_ID;
+  if (!wappiToken || !wappiProfile) return;
+
+  const lang = driver.driver_language ?? 'ru';
+  const msgs: Record<string, string> = {
+    ru: `✅ Заказ №${order.order_number ?? ''} подтверждён. Телефон клиента: ${order.client_phone}`,
+    ka: `✅ შეკვეთა №${order.order_number ?? ''} დადასტურებულია. კლიენტის ტელეფონი: ${order.client_phone}`,
+    en: `✅ Order #${order.order_number ?? ''} confirmed. Client phone: ${order.client_phone}`,
+  };
+
+  await fetch(`https://wappi.pro/api/sync/message/send?profile_id=${wappiProfile}`, {
+    method: 'POST',
+    headers: { Authorization: wappiToken, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ body: msgs[lang] ?? msgs.ru, recipient: driver.phone.replace('+', '') }),
+  });
 }

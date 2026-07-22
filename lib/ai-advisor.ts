@@ -14,6 +14,14 @@ function getClient() {
   });
 }
 
+// Full, untruncated prompt/response dump for every text-agent call — same intent as the
+// existing dump in lib/orchestrator/prompts.ts (voice agent), so the whole multi-agent system
+// is traceable through one log format, not just the voice half.
+function logAgentCall(agentTag: string, messages: unknown, responseContent: string | null | undefined) {
+  console.log(`🤖 [${agentTag}] REQUEST -> ${JSON.stringify(messages)}`);
+  console.log(`🤖 [${agentTag}] RESPONSE <- ${responseContent ?? '(empty)'}`);
+}
+
 // ─── Типы ────────────────────────────────────────────────────────────────────
 
 export type AdvisorRole = 'driver' | 'client';
@@ -288,7 +296,9 @@ export async function chatWithAdvisor(params: {
     messages,
   });
 
-  const reply = response.choices[0]?.message?.content?.trim() ?? 'Не удалось получить ответ.';
+  const rawReply = response.choices[0]?.message?.content;
+  logAgentCall(`ai-advisor.chatWithAdvisor(role=${role})`, messages, rawReply);
+  const reply = rawReply?.trim() ?? 'Не удалось получить ответ.';
 
   // 6. Сохраняем диалог (последние 20 сообщений)
   const updatedHistory: ChatMessage[] = [
@@ -339,26 +349,29 @@ export async function rebuildOrderFaq(orderId: string): Promise<void> {
   ).join('\n\n');
 
   const client = getClient();
-  const response = await client.chat.completions.create({
-    model: 'google/gemini-2.5-flash',
-    temperature: 0.1,
-    max_tokens: 600,
-    messages: [
+  const rebuildMessages = [
       {
-        role: 'system',
+        role: 'system' as const,
         content: `Ты помощник диспетчера. На основе Q&A сессии обнови описание заказа, добавив все выясненные детали.
 Верни JSON: { "live_brief_ai": "обновлённое описание на русском (2-4 предложения)", "faq_summary": "ключевые детали списком для исполнителей" }`,
       },
       {
-        role: 'user',
+        role: 'user' as const,
         content: `Исходное описание: ${order?.live_brief_ai ?? order?.cargo_description}\n\nВыясненные детали:\n${qaPairs}`,
       },
-    ],
+  ];
+  const response = await client.chat.completions.create({
+    model: 'google/gemini-2.5-flash',
+    temperature: 0.1,
+    max_tokens: 600,
+    messages: rebuildMessages,
     response_format: { type: 'json_object' },
   });
 
+  const rebuildContent = response.choices[0]?.message?.content;
+  logAgentCall('ai-advisor.rebuildOrderFaq', rebuildMessages, rebuildContent);
   try {
-    const parsed = JSON.parse(response.choices[0]?.message?.content ?? '{}');
+    const parsed = JSON.parse(rebuildContent ?? '{}');
     if (parsed.live_brief_ai) {
       await supabaseAdmin
         .from('tender_orders')

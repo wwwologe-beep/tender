@@ -23,15 +23,18 @@ interface ConfirmWinnerParams {
   bidId: string;
   driverId: string;
   amount: number;
+  clientPhone: string | null;
 }
 
+// {contact_line} is either a spoken client-phone instruction (no-Telegram / cold-contact
+// winners, who have no site/bot to see it on) or a website/bot pointer (Telegram drivers,
+// kept only as a fallback — Telegram drivers don't actually get this call, see confirmWinnerByCall).
 const CONFIRM_INTRO: Record<string, string> = {
   ka: (
     'შენ ხარ mushebi.ge-ს ხმოვანი ასისტენტი. რეკავ შემსრულებელს, რომელიც კლიენტმა ' +
     'აირჩია გამარჯვებულად კონკრეტულ შეკვეთაზე. მოკლედ დაუდასტურე: შეკვეთა მასზეა, ' +
-    'შეთანხმებული თანხაა {amount}₾. უთხარი, რომ კლიენტის საკონტაქტო ინფორმაცია ' +
-    'უკვე ხელმისაწვდომია საიტზე/ბოტში. საუბარი ხარკოცე და მოკლე იყოს — ეს მხოლოდ ' +
-    'დადასტურებაა, არა მოლაპარაკება.\n\n' +
+    'შეთანხმებული თანხაა {amount}₾. {contact_line} საუბარი ხარკოცე და მოკლე იყოს — ' +
+    'ეს მხოლოდ დადასტურებაა, არა მოლაპარაკება.\n\n' +
     'თუ შემსრულებელი ამბობს, რომ ვერ შეძლებს (გადაიფიქრა, დაკავებულია, ვერ ' +
     'გაართმევს თავს) — პატიოსნად და თანაგრძნობით მიიღე ეს, ნუ დაარწმუნებ ან ' +
     'დავობთ. ორივე შემთხვევაში, საუბრის ბოლოს აუცილებლად გამოიძახე ' +
@@ -41,9 +44,8 @@ const CONFIRM_INTRO: Record<string, string> = {
   en: (
     "You are mushebi.ge's voice assistant. You are calling a service provider who the " +
     'client just selected as the winner for a specific order. Briefly confirm: the order ' +
-    'is theirs, the agreed price is {amount}₾. Tell them the client contact details are ' +
-    'already available on the website/bot. Keep it short — this is a confirmation, not a ' +
-    'negotiation.\n\n' +
+    'is theirs, the agreed price is {amount}₾. {contact_line} Keep it short — this is a ' +
+    'confirmation, not a negotiation.\n\n' +
     "If they say they can't do it after all (changed their mind, got busy, can't manage " +
     "it) — accept that honestly and with understanding, don't argue or try to convince " +
     'them. Either way, always call report_confirmation_result at the end: confirmed if ' +
@@ -52,8 +54,8 @@ const CONFIRM_INTRO: Record<string, string> = {
   ru: (
     'Ты голосовой ассистент mushebi.ge. Звонишь исполнителю, которого клиент только что ' +
     'выбрал победителем по конкретному заказу. Коротко подтверди: заказ за ним, ' +
-    'согласованная цена — {amount}₾. Скажи, что контакты клиента уже доступны на сайте/в ' +
-    'боте. Разговор короткий — это подтверждение, а не переговоры.\n\n' +
+    'согласованная цена — {amount}₾. {contact_line} Разговор короткий — это подтверждение, ' +
+    'а не переговоры.\n\n' +
     'Если исполнитель говорит, что не сможет (передумал, занят, не справится) — прими ' +
     'это честно и с пониманием, не уговаривай и не спорь. В любом случае, в конце ' +
     'разговора обязательно вызови report_confirmation_result: confirmed если подтвердил, ' +
@@ -61,12 +63,28 @@ const CONFIRM_INTRO: Record<string, string> = {
   ),
 };
 
-function buildConfirmationInstructions(amount: number, lang: string): string {
+const CONTACT_LINE_SPOKEN: Record<string, string> = {
+  ka: 'კლიენტის ტელეფონის ნომერია {phone} — უთხარი ეს ნომერი ხმამაღლა და ნელა.',
+  en: "The client's phone number is {phone} — say it out loud, slowly.",
+  ru: 'Номер телефона клиента: {phone} — назови этот номер вслух, медленно.',
+};
+
+const CONTACT_LINE_FALLBACK: Record<string, string> = {
+  ka: 'უთხარი, რომ კლიენტის საკონტაქტო ინფორმაცია უკვე ხელმისაწვდომია საიტზე/ბოტში.',
+  en: 'Tell them the client contact details are already available on the website/bot.',
+  ru: 'Скажи, что контакты клиента уже доступны на сайте/в боте.',
+};
+
+function buildConfirmationInstructions(amount: number, lang: string, clientPhone: string | null): string {
   const template = CONFIRM_INTRO[lang] ?? CONFIRM_INTRO.ru;
+  const contactLine = clientPhone
+    ? (CONTACT_LINE_SPOKEN[lang] ?? CONTACT_LINE_SPOKEN.ru).replace('{phone}', clientPhone)
+    : (CONTACT_LINE_FALLBACK[lang] ?? CONTACT_LINE_FALLBACK.ru);
   // The price is already agreed by this point (driver named it on the earlier outreach call,
   // per rule #1 in driverPricingRules) — these rules matter here mainly for rule #4/#6: don't
   // let the driver renegotiate or suggest going around the platform on this confirmation call.
-  return template.replace('{amount}', String(amount)) + '\n\n' + driverPricingRules(lang);
+  return template.replace('{amount}', String(amount)).replace('{contact_line}', contactLine)
+    + '\n\n' + driverPricingRules(lang);
 }
 
 /**
@@ -88,7 +106,7 @@ export async function confirmWinnerByCall(params: ConfirmWinnerParams): Promise<
   if (driver.telegram_id) return;
 
   const lang = driver.driver_language || 'ru';
-  const instructions = buildConfirmationInstructions(params.amount, lang);
+  const instructions = buildConfirmationInstructions(params.amount, lang, params.clientPhone);
 
   // orderId/bidId are encoded directly in the synthetic attempt id (no order_call_attempts
   // row exists for confirmation calls) so /api/orchestrator/confirmation-result can act on
