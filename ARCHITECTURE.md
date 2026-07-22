@@ -83,7 +83,9 @@
 
 **Логирование (добавлено 22.07.2026):** все 8 функций логируют полный prompt+response в
 консоль (`logAgentCall()` в обоих файлах) — видно в Vercel logs при любом реальном вызове.
-Раньше логировались только ошибки, не сами запросы к модели.
+Раньше логировались только ошибки, не сами запросы к модели. **С этой же даты каждый вызов
+также пишется в постоянную таблицу `system_logs`** (см. §11) — консоль-логи Vercel исчезают
+после ротации, `system_logs` — нет.
 
 ### Голосовые агенты (OpenAI Realtime, `lib/orchestrator/*`)
 
@@ -248,6 +250,7 @@ Asterisk dialplan → Stasis(ai-telephony) → voice_bridge.py:
 | `tender_orders`, `tender_bids`, `tender_drivers` | ✅ | ❌ | Пишет только service role |
 | `order_questions` | ✅ | ❌ | Добавлена 23.06.2026 |
 | `client_otp_codes`, `tender_clients` | ✅ | ✅ (ALL) | Нужен upsert для OTP-флоу |
+| `system_logs` | ❌ | ❌ | Только service role — внутренний диагностический канал, не клиентские данные |
 
 ---
 
@@ -280,3 +283,39 @@ npx ts-node -r tsconfig-paths/register --project scripts/tsconfig.json scripts/t
 `scripts/diag.ts` — список исполнителей, кто получит уведомления, последние заказы.
 `scripts/test-full-cycle.ts` — E2E 25 шагов текстового цикла (создание → вопрос → ответ →
 ставка → выбор). Не покрывает голосовой оркестратор — тот проверяется только живыми звонками.
+
+---
+
+## 11. Персистентное логирование (`system_logs`, добавлено 22.07.2026)
+
+Console.log/console.error видны только в реальном времени и исчезают после ротации логов
+Vercel/VPS — не было способа посмотреть конкретный инцидент после факта одним запросом.
+Таблица `system_logs` (миграция `20260722_create_system_logs.sql`) — единая точка сбора:
+
+| Поле | Назначение |
+|---|---|
+| `source` | `ai-agent` \| `voice-call` \| `api` \| `webhook` |
+| `tag` | Имя функции/точки (`ai.analyzeOrder`, `orchestrator.call-result`, `wappi-webhook.incoming`) |
+| `order_id` | Привязка к заказу, если применимо (nullable) |
+| `data` | Произвольный JSON — полный prompt/response, transcript, args входящего запроса |
+
+**Что уже пишет туда (`lib/system-log.ts:logSystemEvent()`):**
+- Все 8 текстовых AI-агентов — полный prompt + response (`logAgentCall()` в `lib/ai.ts`/`lib/ai-advisor.ts`).
+- Голосовой system-prompt для каждого исходящего звонка (`prompts.ts:buildVoiceCallInstructions()`).
+- Результат каждого звонка — исход, транскрипт, `tool_result` (`call-result/route.ts`).
+- Каждое входящее WhatsApp-сообщение (`webhook/wappi/route.ts`) — текст, isReply, quoted text.
+
+**Не пишет туда:** `voice_bridge.py`/`client_bridge.py` на VPS — у них нет прямого доступа
+к Supabase (секреты намеренно не выносятся на VPS), сама суть разговора уже покрыта через
+Next.js callback'и выше. `voice_bridge.log` на VPS остаётся вторичным источником для
+низкоуровневой ARI/RTP-диагностики (создание bridge, RTP-порты), не для анализа диалогов.
+
+**Как скачать логи для анализа:**
+```bash
+npx ts-node -r tsconfig-paths/register --project scripts/tsconfig.json scripts/pull-logs.ts
+npx ts-node -r tsconfig-paths/register --project scripts/tsconfig.json scripts/pull-logs.ts --hours=2
+npx ts-node -r tsconfig-paths/register --project scripts/tsconfig.json scripts/pull-logs.ts --order=<order_id>
+npx ts-node -r tsconfig-paths/register --project scripts/tsconfig.json scripts/pull-logs.ts --source=voice-call
+```
+Сохраняет в `logs/` (gitignored) два файла с временной меткой: `.jsonl` (полные данные,
+по записи на строку) и `.txt` (читаемый формат для быстрого просмотра).
