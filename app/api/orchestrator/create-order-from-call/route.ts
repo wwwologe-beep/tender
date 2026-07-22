@@ -7,6 +7,7 @@ import { buildCallCandidates } from '@/lib/orchestrator/matching';
 import { createCallSequence } from '@/lib/orchestrator/sequence';
 import { originateNextAttempt } from '@/lib/orchestrator/tick';
 import { countInFlightCalls, MAX_CONCURRENT_CALLS } from '@/lib/orchestrator/concurrency';
+import { logSystemEvent } from '@/lib/system-log';
 
 /**
  * Fired from asterisk/voice_bridge.py mid-inbound-call when the AI's create_order tool is
@@ -29,6 +30,26 @@ export async function POST(req: NextRequest) {
   }
 
   console.log(`🔧 [voice-call] create_order(caller_phone=${caller_phone}, description=${JSON.stringify(description)})`);
+
+  // Link the call to the same client profile the web OTP flow uses (tender_clients, unique
+  // on phone) — without this, every inbound call was treated as a brand-new anonymous
+  // caller even if the same person had ordered before, on any channel. Check for an existing
+  // row first (to log/know whether this is a repeat caller), then upsert (not just insert)
+  // so an existing row's session_token/created_at is preserved, only last_login is refreshed.
+  const { data: existingClient } = await supabaseAdmin
+    .from('tender_clients')
+    .select('id')
+    .eq('phone', caller_phone)
+    .maybeSingle();
+  const isReturningClient = !!existingClient;
+
+  await supabaseAdmin
+    .from('tender_clients')
+    .upsert(
+      { phone: caller_phone, last_login: new Date().toISOString() },
+      { onConflict: 'phone' }
+    );
+  console.log(`🔧 [voice-call] create_order: ${isReturningClient ? 'returning' : 'new'} client (phone=${caller_phone})`);
 
   let category = 'general';
   let aiSummary: string | null = null;
@@ -100,6 +121,14 @@ export async function POST(req: NextRequest) {
   } catch (e) {
     console.error('[create-order-from-call] buildCallCandidates', e);
   }
+
+  logSystemEvent({
+    source: 'voice-call',
+    tag: 'orchestrator.create-order-from-call',
+    orderId: order.id,
+    message: `Order #${order.order_number} created from inbound call (${isReturningClient ? 'returning' : 'new'} client, phone=${caller_phone})`,
+    data: { caller_phone, description, address, category, isReturningClient },
+  });
 
   return NextResponse.json({ ok: true, order_id: order.id, order_number: order.order_number, token: order.token });
 }
