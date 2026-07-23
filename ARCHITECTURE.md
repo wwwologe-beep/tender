@@ -72,7 +72,7 @@
 | Слой | Технология |
 |---|---|
 | **Frontend** | Next.js 15 (App Router), TypeScript, Tailwind CSS |
-| **Деплой** | Vercel (`tender-navy.vercel.app` — прод-адрес прямо сейчас, кастомный домен `mushebi.ge` НЕ подключён, см. `PROJECT.md` §4) |
+| **Деплой** | **Мигрирует с Vercel на Railway (в процессе, 23.07.2026)** — см. §2a. Кастомный домен `mushebi.ge` НЕ подключён ни к одному из двух, см. `PROJECT.md` §4 |
 | **База данных** | Supabase (PostgreSQL + Realtime + RLS) |
 | **Telegram-бот** | [grammY](https://grammy.dev/) — webhook-режим |
 | **WhatsApp** | Wappi.pro API (OTP-префикс `msb_`, входящие сообщения через один webhook) |
@@ -80,6 +80,41 @@
 | **AI (голос)** | OpenAI Realtime API (`gpt-realtime`) — отдельный ключ, не через OpenRouter |
 | **Телефония** | Asterisk 22.5.2 на отдельном VPS (Kamatera, `79.108.163.50`), SIP-транк citynet.ge |
 | **Скрипты** | `npx ts-node -r tsconfig-paths/register --project scripts/tsconfig.json <файл>` |
+
+---
+
+## 2a. Миграция Vercel → Railway (в процессе, начата 23.07.2026)
+
+**Причина:** Vercel (serverless) не может держать частый нативный cron — `cron/tick`
+дёргался внешним пингом раз в ~10 минут (при этом обнаружено, что `vercel.json` пуст,
+хотя код содержит комментарий "Vercel Cron: каждые 10 минут" — исходный механизм
+триггера, вероятно, был отключён/удалён в какой-то момент, точная причина не установлена).
+Railway — обычный долгоживущий сервер, может держать процесс с `setInterval` и стучаться
+на себя же хоть раз в минуту.
+
+**Railway-проект:** workspace `heroic-recreation`, сервис `tender`, подключён к тому же
+GitHub-репозиторию `wwwologe-beep/tender`, ветка `main`, автодеплой по push включён.
+Прод-URL: `https://tender-production-26c5.up.railway.app`.
+
+**Важная техническая деталь, стоившая одного неудачного деплоя:** Next.js на Railway
+(Railpack builder) слушает порт **8080** по умолчанию (не 3000, как многие ожидают) —
+домен в Networking должен указывать на порт 8080, иначе `502 Application failed to
+respond`, даже если сборка прошла успешно.
+
+**Статус по компонентам (на момент записи):**
+| Компонент | Статус |
+|---|---|
+| Основной сервис (сайт + все API) | ✅ Деплоится, отвечает 200 на Railway |
+| Все ~21 env-переменная перенесены | ✅ (часть через Raw Editor вручную, включая 3 "Sensitive"-переменные Vercel, которые пришлось пересоздать заново, а не скопировать — Vercel не показывает их значение никому после создания) |
+| `ORCHESTRATOR_BRIDGE_SECRET` | ✅ Пересоздан заново (новый секрет), синхронизирован между Railway и VPS (`/root/.voice_bridge.env`) |
+| Telegram webhook | ✅ Переключён на Railway. Также обнаружено и попутно исправлено: до этого бот указывал на **старый ngrok-туннель**, уже отдававший 404 — бот не работал вообще, независимо от этой миграции |
+| Wappi (WhatsApp) webhook | ✅ Переключён на Railway (настроено в дашборде app.wappi.pro) |
+| VPS `voice_bridge.py` → `NEXTJS_APP_URL` | ✅ Переключён на Railway, процесс перезапущен |
+| Частый cron (главная цель миграции) | ⚠️ В процессе — `scripts/railway-cron-ping.js` создан (отдельный лёгкий Node-процесс, пингует `/api/cron/tick` раз в минуту с Bearer-авторизацией через новый `CRON_SECRET`), нужно задеплоить как второй Railway-сервис в том же проекте с Custom Start Command `node scripts/railway-cron-ping.js` |
+| Vercel (`tender-navy.vercel.app`) | Остаётся как резерв, ещё не отключён |
+
+**Не сделано:** финальное подтверждение end-to-end (реальный звонок/заказ через Railway
+после полного переключения cron), отключение старого Vercel-деплоя.
 
 ---
 
@@ -343,18 +378,23 @@ Asterisk dialplan → Stasis(ai-telephony) → voice_bridge.py:
 
 ## 9. Переменные окружения
 
+**С 23.07.2026 актуальное окружение — Railway** (см. §2a), не Vercel — все ниже
+перечисленные переменные перенесены туда же (часть пересоздана с новыми значениями, не
+скопирована — см. §2a про "Sensitive"-переменные Vercel). Vercel ещё жив как резерв.
+
 | Переменная | Где | Описание |
 |---|---|---|
-| `NEXT_PUBLIC_SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` | Vercel | Supabase |
-| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ADMIN_ID`, `TELEGRAM_ADMIN_CHAT_ID` | Vercel | Бот и модерация |
-| `WAPPI_TOKEN`, `WAPPI_PROFILE_ID` | Vercel | WhatsApp |
-| `OPENROUTER_API_KEY` | Vercel | Текстовые AI-агенты |
-| `NEXT_PUBLIC_APP_URL` | Vercel | Прод-URL для ссылок клиентам (сейчас `tender-navy.vercel.app` — многие места ещё хардкодят `mushebi.ge`, см. `PROJECT.md`) |
-| `ORCHESTRATOR_BRIDGE_SECRET` | Vercel + VPS | Общий bearer-секрет Next.js ↔ `voice_bridge.py` |
-| `ASTERISK_BRIDGE_URL` | Vercel | `http://<vps>:8090` |
-| `CLIENT_BRIDGE_URL` | Vercel | `http://<vps>:8091` |
-| `ORCHESTRATOR_MAX_CONCURRENT_CALLS` | Vercel | Опционально, default 4 |
-| `ORCHESTRATOR_CALLER_ID` | Vercel | Caller ID исходящих звонков |
+| `NEXT_PUBLIC_SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` | Railway (+ Vercel резерв) | Supabase |
+| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ADMIN_ID`, `TELEGRAM_ADMIN_CHAT_ID` | Railway (+ Vercel резерв) | Бот и модерация |
+| `WAPPI_TOKEN`, `WAPPI_PROFILE_ID` | Railway (+ Vercel резерв) | WhatsApp |
+| `OPENROUTER_API_KEY` | Railway (+ Vercel резерв) | Текстовые AI-агенты |
+| `NEXT_PUBLIC_APP_URL` | Railway (+ Vercel резерв) | Прод-URL для ссылок клиентам (сейчас `tender-production-26c5.up.railway.app` — многие места ещё хардкодят `mushebi.ge`, см. `PROJECT.md`) |
+| `ORCHESTRATOR_BRIDGE_SECRET` | Railway + VPS | Общий bearer-секрет Next.js ↔ `voice_bridge.py`. **Пересоздан заново 23.07.2026** при миграции (Vercel-версия была Sensitive, нечитаема — проще сгенерировать новый и синхронизировать оба места, чем восстанавливать старый) |
+| `ASTERISK_BRIDGE_URL` | Railway | `http://79.108.163.50:8090` |
+| `CLIENT_BRIDGE_URL` | Railway | `http://79.108.163.50:8091` |
+| `ORCHESTRATOR_MAX_CONCURRENT_CALLS` | Railway | Опционально, default 4 |
+| `ORCHESTRATOR_CALLER_ID` | Railway | Caller ID исходящих звонков (2115325) |
+| `CRON_SECRET` | Railway (основной сервис + cron-ping сервис) | **Новый, добавлен 23.07.2026** — Bearer-авторизация для `GET /api/cron/tick`. Не существовал нигде раньше несмотря на то, что код его уже требовал — `cron/tick` фактически было `401 Unauthorized` для любого вызывающего, если тот не знал правильное значение |
 | `OPENAI_API_KEY` | VPS | OpenAI Realtime — отдельный ключ, не OpenRouter |
 | `ORCHESTRATOR_TEST_PHONE` | VPS `.voice_bridge.env` | Если задан — ЛЮБОЙ голосовой звонок уходит на этот номер вместо реального адресата. Использовать для тестов, снять/сменить перед боевым режимом. |
 
