@@ -23,6 +23,7 @@ interface Order {
   notes: string | null;
   workers_needed: number | null;
   vehicles_needed: number | null;
+  media_urls: string[] | null;
 }
 
 interface Driver {
@@ -109,7 +110,7 @@ export default function FeedPage() {
   const loadData = useCallback(async () => {
     const { data: orderData, error: orderErr } = await supabase
       .from('tender_orders')
-      .select('id, token, status, cargo_description, address_from, address_to, client_budget, category, live_brief_ai, winning_bid_id, created_at, client_phone, notes, workers_needed, vehicles_needed')
+      .select('id, token, status, cargo_description, address_from, address_to, client_budget, category, live_brief_ai, winning_bid_id, created_at, client_phone, notes, workers_needed, vehicles_needed, media_urls')
       .eq('token', token)
       .single();
 
@@ -318,6 +319,20 @@ export default function FeedPage() {
 
           {order.notes && (
             <p className="text-sm text-gray-500 border-t border-gray-50 pt-3">{order.notes}</p>
+          )}
+
+          {Array.isArray(order.media_urls) && order.media_urls.length > 0 && (
+            <div className="grid grid-cols-3 gap-2 border-t border-gray-50 pt-3">
+              {order.media_urls.map((url, i) => (
+                <a key={url} href={url} target="_blank" rel="noopener noreferrer" className="block relative aspect-square rounded-lg overflow-hidden bg-gray-100">
+                  {url.match(/\.mp4($|\?)/i) ? (
+                    <video src={url} className="w-full h-full object-cover" muted />
+                  ) : (
+                    <Image src={url} alt={`Фото ${i + 1}`} fill sizes="200px" className="object-cover" />
+                  )}
+                </a>
+              ))}
+            </div>
           )}
 
           {order.live_brief_ai && order.live_brief_ai !== order.cargo_description && (
