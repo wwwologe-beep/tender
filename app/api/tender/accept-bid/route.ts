@@ -67,6 +67,32 @@ export async function POST(req: NextRequest) {
       .update({ active_order_id: resolvedOrderId })
       .eq('id', winBid.driver_id);
 
+    // Клиент до сих пор никак активно не уведомлялся о выборе — только исполнитель получает
+    // сообщение в Telegram/звонок (ниже). Без этого клиенту нужно было самому зайти на сайт
+    // снова, чтобы увидеть номер исполнителя. Присылаем контакт сразу же через WhatsApp,
+    // тем же каналом, что и остальные уведомления клиенту в этом файле/cron/tick.
+    const wappiToken = process.env.WAPPI_TOKEN;
+    const wappiProfile = process.env.WAPPI_PROFILE_ID;
+    if (wappiToken && wappiProfile && order.client_phone) {
+      const { data: winnerDriver } = await supabaseAdmin
+        .from('tender_drivers')
+        .select('name, phone')
+        .eq('id', winBid.driver_id)
+        .single();
+      if (winnerDriver?.phone) {
+        const text =
+          `✅ Вы выбрали исполнителя по заявке #${order.order_number}!\n\n` +
+          `👤 ${winnerDriver.name ?? 'Исполнитель'}\n` +
+          `📞 ${winnerDriver.phone}\n\n` +
+          `Свяжитесь с ним напрямую для уточнения деталей встречи.`;
+        await fetch(`https://wappi.pro/api/sync/message/send?profile_id=${wappiProfile}`, {
+          method: 'POST',
+          headers: { Authorization: wappiToken, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ body: text, recipient: (order.client_phone as string).replace('+', '') }),
+        }).catch(err => console.error('[accept-bid client whatsapp]', err));
+      }
+    }
+
     // Fire-and-forget: победителям без Telegram (например, конвертированным из cold_contacts
     // голосовым звонком) больше неоткуда узнать, что их выбрали — звоним и подтверждаем.
     // Telegram-исполнители уже получают уведомление через bot.api ниже, звонок им не нужен.
