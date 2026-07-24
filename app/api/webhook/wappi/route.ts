@@ -19,19 +19,30 @@ export async function POST(req: NextRequest) {
     for (const msg of messages) {
       const text   = (msg.body ?? '').trim();
       const sender = (msg.author ?? msg.from ?? '').replace(/[^0-9]/g, '');
+      const isMedia = msg.type === 'image' || msg.type === 'video';
 
       logSystemEvent({
         source: 'webhook',
         tag: 'wappi-webhook.incoming',
-        message: `Incoming WhatsApp message from ${sender}: "${text.slice(0, 200)}"`,
-        data: { sender, text, type: msg.type, isReply: msg.isReply ?? false, quotedText: msg.reply_message?.body },
+        message: isMedia
+          ? `Incoming WhatsApp ${msg.type} from ${sender} (${text.length} bytes base64)`
+          : `Incoming WhatsApp message from ${sender}: "${text.slice(0, 200)}"`,
+        // Never log the raw base64 body — a single photo is hundreds of KB and would bloat
+        // system_logs on every send; text.length is enough to confirm data actually arrived.
+        data: { sender, textLength: text.length, type: msg.type, isReply: msg.isReply ?? false, quotedText: msg.reply_message?.body },
       });
 
-      // Фото/видео (mimetype/s3Info присутствуют у медиа-сообщений) — сохраняем к
-      // активному заказу этого номера, не трактуя как текстовый ответ на вопрос.
-      const mediaUrl = Array.isArray(msg.s3Info) ? msg.s3Info[0]?.url : msg.s3Info?.url;
-      if ((msg.type === 'image' || msg.type === 'video') && mediaUrl) {
-        await handleIncomingMedia(mediaUrl, sender);
+      // Wappi sends media two different ways depending on the message: sometimes as a
+      // downloadable URL (s3Info.url), other times as the raw file inline, base64-encoded,
+      // directly in `body` (confirmed via live test — the documented s3Info shape did not
+      // show up at all for a real photo reply). Handle both rather than assuming one.
+      const s3Url = Array.isArray(msg.s3Info) ? msg.s3Info[0]?.url : msg.s3Info?.url;
+      if (isMedia && s3Url) {
+        await handleIncomingMedia({ kind: 'url', value: s3Url }, sender, msg.type!);
+        continue;
+      }
+      if (isMedia && text) {
+        await handleIncomingMedia({ kind: 'base64', value: text }, sender, msg.type!);
         continue;
       }
 
@@ -187,12 +198,20 @@ interface WappiMessage {
   s3Info?: { url?: string } | { url?: string }[];
 }
 
+type IncomingMedia = { kind: 'url'; value: string } | { kind: 'base64'; value: string };
+
+// Real bucket name in Supabase Storage is "tender-media" (hyphen) — note app/page.tsx's
+// own BUCKET constant says "tender_media" (underscore), which doesn't match any real
+// bucket; that's a pre-existing mismatch in the form's upload path, left alone here since
+// fixing it is out of scope for this webhook change.
+const MEDIA_BUCKET = 'tender-media';
+
 /**
  * Клиент прислал фото/видео текущего состояния (в ответ на запрос из tender/create,
  * см. needsMediaCategories) — находим его активный заказ по номеру и дописываем
  * media_urls, чтобы исполнители увидели материал в карточке/фиде.
  */
-async function handleIncomingMedia(mediaUrl: string, sender: string) {
+async function handleIncomingMedia(media: IncomingMedia, sender: string, msgType: string) {
   const senderClean = sender.replace(/^0+/, '');
   if (senderClean.length < 9) return;
 
@@ -215,6 +234,26 @@ async function handleIncomingMedia(mediaUrl: string, sender: string) {
   // photo doesn't silently attach to an already-illustrated order.
   const order = matches.find(o => !Array.isArray(o.media_urls) || o.media_urls.length === 0)
     ?? matches[0];
+
+  let mediaUrl: string;
+  if (media.kind === 'url') {
+    mediaUrl = media.value;
+  } else {
+    // Wappi sent the file inline as base64 (no downloadable URL) — upload it to the same
+    // Storage bucket the web form uses, so media_urls stays a plain list of https URLs
+    // everywhere it's rendered (feed, Telegram card), instead of mixing in raw base64.
+    const ext = msgType === 'video' ? 'mp4' : 'jpg';
+    const path = `whatsapp/${order.id}-${randomUUID()}.${ext}`;
+    const bytes = Buffer.from(media.value, 'base64');
+    const { error: uploadErr } = await supabaseAdmin.storage
+      .from(MEDIA_BUCKET)
+      .upload(path, bytes, { contentType: msgType === 'video' ? 'video/mp4' : 'image/jpeg', upsert: false });
+    if (uploadErr) {
+      console.error('[wappi webhook] media upload failed:', uploadErr);
+      return;
+    }
+    mediaUrl = supabaseAdmin.storage.from(MEDIA_BUCKET).getPublicUrl(path).data.publicUrl;
+  }
 
   const existing = Array.isArray(order.media_urls) ? order.media_urls : [];
   await supabaseAdmin
