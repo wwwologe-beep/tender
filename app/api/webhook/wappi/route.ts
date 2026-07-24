@@ -24,8 +24,16 @@ export async function POST(req: NextRequest) {
         source: 'webhook',
         tag: 'wappi-webhook.incoming',
         message: `Incoming WhatsApp message from ${sender}: "${text.slice(0, 200)}"`,
-        data: { sender, text, isReply: msg.isReply ?? false, quotedText: msg.reply_message?.body },
+        data: { sender, text, type: msg.type, isReply: msg.isReply ?? false, quotedText: msg.reply_message?.body },
       });
+
+      // Фото/видео (mimetype/s3Info присутствуют у медиа-сообщений) — сохраняем к
+      // активному заказу этого номера, не трактуя как текстовый ответ на вопрос.
+      const mediaUrl = Array.isArray(msg.s3Info) ? msg.s3Info[0]?.url : msg.s3Info?.url;
+      if ((msg.type === 'image' || msg.type === 'video') && mediaUrl) {
+        await handleIncomingMedia(mediaUrl, sender);
+        continue;
+      }
 
       // Ищем код вида msb_XXXXX
       const match = text.match(/msb_[A-Z0-9]{5}/i);
@@ -175,6 +183,40 @@ interface WappiMessage {
   from?: string;
   isReply?: boolean;
   reply_message?: { body?: string };
+  type?: string;
+  s3Info?: { url?: string } | { url?: string }[];
+}
+
+/**
+ * Клиент прислал фото/видео текущего состояния (в ответ на запрос из tender/create,
+ * см. needsMediaCategories) — находим его активный заказ по номеру и дописываем
+ * media_urls, чтобы исполнители увидели материал в карточке/фиде.
+ */
+async function handleIncomingMedia(mediaUrl: string, sender: string) {
+  const senderClean = sender.replace(/^0+/, '');
+  if (senderClean.length < 9) return;
+
+  const { data: candidates } = await supabaseAdmin
+    .from('tender_orders')
+    .select('id, media_urls, client_phone')
+    .not('client_phone', 'is', null)
+    .in('status', ['bidding', 'selected']);
+
+  const order = (candidates ?? []).find(o => {
+    const phoneClean = (o.client_phone ?? '').replace(/^\+/, '').replace(/^0+/, '');
+    return phoneClean.length >= 9 && senderClean.endsWith(phoneClean.slice(-9));
+  });
+  if (!order) return;
+
+  const existing = Array.isArray(order.media_urls) ? order.media_urls : [];
+  await supabaseAdmin
+    .from('tender_orders')
+    .update({ media_urls: [...existing, mediaUrl] })
+    .eq('id', order.id);
+
+  await refreshAllCards(order.id).catch(console.error);
+
+  console.log(`[wappi webhook] ✅ Медиа от клиента сохранено к заказу ${order.id}: ${mediaUrl}`);
 }
 
 interface WappiWebhook {

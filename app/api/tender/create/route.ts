@@ -109,10 +109,12 @@ export async function POST(req: NextRequest) {
     ].filter(Boolean).join('. ');
 
     // AI-анализ выполняем синхронно — Vercel убивает фоновые задачи после ответа
+    let resolvedCategory = body.category ?? 'general';
     if (process.env.OPENROUTER_API_KEY) {
       try {
         const analysis = await analyzeOrder(rawText);
         if (analysis) {
+          resolvedCategory = analysis.category;
           await supabaseAdmin.from('tender_orders').update({
             category: analysis.category,
             ai_summary: analysis.ai_summary,
@@ -180,6 +182,23 @@ export async function POST(req: NextRequest) {
         headers: { Authorization: wappiToken, 'Content-Type': 'application/json' },
         body: JSON.stringify({ body: onboardingText, recipient: body.client_phone.replace('+', '') }),
       }).catch(err => console.error('[onboarding whatsapp]', err));
+
+      // Для категорий где фото/видео текущего состояния сильно влияют на оценку
+      // (уборка — объём грязи, переезд/грузчики — объём и хрупкость вещей) — если
+      // клиент ничего не приложил через форму, просим прислать медиа отдельным
+      // сообщением. Ответ придёт как обычное WhatsApp-сообщение с фото/видео и
+      // будет подхвачен handleIncomingMedia в webhook/wappi.
+      const needsMediaCategories = ['cleaning', 'moving', 'movers'];
+      if (needsMediaCategories.includes(resolvedCategory) && (!body.media_urls || body.media_urls.length === 0)) {
+        const mediaRequestText =
+          `📸 Пришлите, пожалуйста, сюда в WhatsApp фото или видео текущего состояния ` +
+          `(что нужно убрать/перевезти) — так исполнители смогут точнее оценить объём работы.`;
+        await fetch(`https://wappi.pro/api/sync/message/send?profile_id=${wappiProfile}`, {
+          method: 'POST',
+          headers: { Authorization: wappiToken, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ body: mediaRequestText, recipient: body.client_phone.replace('+', '') }),
+        }).catch(err => console.error('[media request whatsapp]', err));
+      }
     }
 
     return NextResponse.json({ order: data, client_url: clientUrl }, { status: 201 });
