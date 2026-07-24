@@ -255,11 +255,19 @@ async function handleIncomingMedia(media: IncomingMedia, sender: string, msgType
     mediaUrl = supabaseAdmin.storage.from(MEDIA_BUCKET).getPublicUrl(path).data.publicUrl;
   }
 
-  const existing = Array.isArray(order.media_urls) ? order.media_urls : [];
-  await supabaseAdmin
-    .from('tender_orders')
-    .update({ media_urls: [...existing, mediaUrl] })
-    .eq('id', order.id);
+  // Atomic append via RPC (see 20260724_append_order_media_url.sql) — two WhatsApp photos
+  // arriving milliseconds apart both used to read the same stale media_urls here and race
+  // each other on the UPDATE, silently dropping one (confirmed by a live test: two photos
+  // sent, only one ended up saved). A plain read-modify-write in JS can't fix that; the
+  // append has to happen inside a single UPDATE on the DB side.
+  const { error: appendErr } = await supabaseAdmin.rpc('append_order_media_url', {
+    p_order_id: order.id,
+    p_media_url: mediaUrl,
+  });
+  if (appendErr) {
+    console.error('[wappi webhook] append_order_media_url failed:', appendErr);
+    return;
+  }
 
   await refreshAllCards(order.id).catch(console.error);
 
