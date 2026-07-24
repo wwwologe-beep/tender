@@ -198,15 +198,23 @@ async function handleIncomingMedia(mediaUrl: string, sender: string) {
 
   const { data: candidates } = await supabaseAdmin
     .from('tender_orders')
-    .select('id, media_urls, client_phone')
+    .select('id, media_urls, client_phone, created_at')
     .not('client_phone', 'is', null)
-    .in('status', ['bidding', 'selected']);
+    .in('status', ['bidding', 'selected'])
+    .order('created_at', { ascending: false });
 
-  const order = (candidates ?? []).find(o => {
+  const matches = (candidates ?? []).filter(o => {
     const phoneClean = (o.client_phone ?? '').replace(/^\+/, '').replace(/^0+/, '');
     return phoneClean.length >= 9 && senderClean.endsWith(phoneClean.slice(-9));
   });
-  if (!order) return;
+  if (matches.length === 0) return;
+
+  // A client can have several active orders at once — prefer the one still missing media
+  // (the most likely target of "please send photos"), most recent first. Only fall back to
+  // "most recent order overall" if every match already has media, so a second unrelated
+  // photo doesn't silently attach to an already-illustrated order.
+  const order = matches.find(o => !Array.isArray(o.media_urls) || o.media_urls.length === 0)
+    ?? matches[0];
 
   const existing = Array.isArray(order.media_urls) ? order.media_urls : [];
   await supabaseAdmin
