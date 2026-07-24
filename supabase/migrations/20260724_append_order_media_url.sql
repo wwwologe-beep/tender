@@ -5,14 +5,10 @@
 -- результат первого, теряя одно фото. Делая append внутри одного UPDATE на стороне Postgres,
 -- конкурентные вызовы больше не могут друг друга затереть.
 --
--- media_urls's actual column type (text[] vs jsonb) wasn't found in a migration file in this
--- repo (created directly in the Supabase dashboard earlier) — this version handles jsonb,
--- since that's what a "select media_urls" returning a plain JS array through supabase-js
--- most commonly means for a column added via the dashboard's "array" helper. If this errors
--- with a type mismatch when applied, the column is text[] instead — swap the SET line for:
---   SET media_urls = to_jsonb(array_append(COALESCE(ARRAY(SELECT jsonb_array_elements_text(media_urls)), ARRAY[]::text[]), p_media_url))
--- or, if truly text[]:
---   SET media_urls = array_append(COALESCE(media_urls, ARRAY[]::text[]), p_media_url)
+-- Confirmed via a direct RPC test call against a real row (2026-07-24): media_urls is
+-- text[], not jsonb — the first jsonb version of this function always errored
+-- ("COALESCE types text[] and jsonb cannot be matched"), silently dropping every photo
+-- after it was deployed, not just concurrent ones. This version matches the real type.
 CREATE OR REPLACE FUNCTION append_order_media_url(
   p_order_id uuid,
   p_media_url text
@@ -23,7 +19,7 @@ SECURITY DEFINER
 AS $$
 BEGIN
   UPDATE tender_orders
-     SET media_urls = COALESCE(media_urls, '[]'::jsonb) || to_jsonb(p_media_url)
+     SET media_urls = array_append(COALESCE(media_urls, ARRAY[]::text[]), p_media_url)
    WHERE id = p_order_id;
 END;
 $$;

@@ -183,16 +183,18 @@ export async function POST(req: NextRequest) {
         body: JSON.stringify({ body: onboardingText, recipient: body.client_phone.replace('+', '') }),
       }).catch(err => console.error('[onboarding whatsapp]', err));
 
-      // Для категорий где фото/видео текущего состояния сильно влияют на оценку
-      // (уборка — объём грязи, переезд/грузчики — объём и хрупкость вещей) — если
-      // клиент ничего не приложил через форму, просим прислать медиа отдельным
-      // сообщением. Ответ придёт как обычное WhatsApp-сообщение с фото/видео и
-      // будет подхвачен handleIncomingMedia в webhook/wappi.
-      const needsMediaCategories = ['cleaning', 'moving', 'movers'];
-      if (needsMediaCategories.includes(resolvedCategory) && (!body.media_urls || body.media_urls.length === 0)) {
+      // Фото/видео текущего состояния полезны почти для любой физической задачи — не
+      // только переезд/уборка, но и вывоз мусора, снос/демонтаж, мелкий ремонт ("повесить
+      // картину вот тут") и т.д. — а не только для узкого списка категорий. courier —
+      // единственное явное исключение (доставка A→B, фотографировать нечего). Если клиент
+      // ничего не приложил через форму, просим прислать медиа отдельным сообщением. Ответ
+      // придёт как обычное WhatsApp-сообщение с фото/видео и будет подхвачен
+      // handleIncomingMedia в webhook/wappi.
+      if (resolvedCategory !== 'courier' && (!body.media_urls || body.media_urls.length === 0)) {
         const mediaRequestText =
-          `📸 Пришлите, пожалуйста, сюда в WhatsApp фото или видео текущего состояния ` +
-          `(что нужно убрать/перевезти) — так исполнители смогут точнее оценить объём работы.`;
+          `📸 Пришлите, пожалуйста, сюда в WhatsApp фото или видео по вашей задаче ` +
+          `(что есть сейчас, что нужно сделать) — так исполнители смогут точнее оценить объём работы. ` +
+          `Можно прислать сколько угодно фото и видео.`;
         await fetch(`https://wappi.pro/api/sync/message/send?profile_id=${wappiProfile}`, {
           method: 'POST',
           headers: { Authorization: wappiToken, 'Content-Type': 'application/json' },
