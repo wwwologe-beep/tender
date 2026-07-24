@@ -24,6 +24,7 @@ export async function GET(req: NextRequest) {
     requestRatings().then(r => results.push(r)),
     advanceCallSequences().then(r => results.push(r)),
     callClientsForClarification().then(r => results.push(r)),
+    sendMediaThanks().then(r => results.push(r)),
   ]);
 
   console.log('[cron/tick]', results.join(' | '));
@@ -388,6 +389,59 @@ async function callClientsForClarification(): Promise<string> {
   }
 
   return `clarification-call: ${called} clients called`;
+}
+
+// ─── 8. "Спасибо за фото/видео" — debounced после серии медиа от клиента ─────
+
+/**
+ * A client can reply with the media request (see tender/create's mediaRequestText) by
+ * sending several photos/videos in a row over a few seconds — each one bumps
+ * last_media_received_at (see append_order_media_url). Rather than acknowledge every single
+ * one individually (spammy for someone sending 10-20 photos), wait until at least one full
+ * tick has passed with no new media, then send ONE "thanks, sending this to masters now"
+ * message. This closes the loop the user asked for: client sends media -> gets confirmation
+ * -> understands the tender is now running (drivers were already notified at order creation,
+ * this just tells the client that happened).
+ */
+async function sendMediaThanks(): Promise<string> {
+  const ONE_MINUTE_AGO = new Date(Date.now() - 60 * 1000).toISOString();
+
+  const { data: orders } = await supabaseAdmin
+    .from('tender_orders')
+    .select('id, order_number, client_phone')
+    .not('last_media_received_at', 'is', null)
+    .is('media_thanks_sent_at', null)
+    .lt('last_media_received_at', ONE_MINUTE_AGO);
+
+  if (!orders?.length) return 'media-thanks: 0';
+
+  const wappiToken = process.env.WAPPI_TOKEN;
+  const wappiProfile = process.env.WAPPI_PROFILE_ID;
+  if (!wappiToken || !wappiProfile) return 'media-thanks: 0 (no wappi config)';
+
+  let sent = 0;
+  for (const order of orders) {
+    if (!order.client_phone) continue;
+
+    const text =
+      `✅ Спасибо за фото/видео!\n\n` +
+      `Мы разошлём вашу заявку #${order.order_number} мастерам и устроим тендер — ` +
+      `соберём предложения и покажем вам лучшие. Вы выберете подходящее, и мы сразу оповестим мастера.`;
+    await fetch(`https://wappi.pro/api/sync/message/send?profile_id=${wappiProfile}`, {
+      method: 'POST',
+      headers: { Authorization: wappiToken, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ body: text, recipient: (order.client_phone as string).replace('+', '') }),
+    }).catch(err => console.error('[cron media-thanks]', err));
+
+    await supabaseAdmin
+      .from('tender_orders')
+      .update({ media_thanks_sent_at: new Date().toISOString() })
+      .eq('id', order.id);
+
+    sent++;
+  }
+
+  return `media-thanks: ${sent} sent`;
 }
 
 // ─── 4. Сброс зависших bot_state > 2 часов ───────────────────────────────────

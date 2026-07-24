@@ -19,7 +19,11 @@ SECURITY DEFINER
 AS $$
 BEGIN
   UPDATE tender_orders
-     SET media_urls = array_append(COALESCE(media_urls, ARRAY[]::text[]), p_media_url)
+     SET media_urls = array_append(COALESCE(media_urls, ARRAY[]::text[]), p_media_url),
+         -- Marks "a photo just arrived" so cron/tick's media-thanks job (see
+         -- 20260724_media_confirmation_tracking.sql) can debounce the client-facing
+         -- "thanks, we're sending this to masters" message instead of sending one per photo.
+         last_media_received_at = NOW()
    WHERE id = p_order_id;
 END;
 $$;
