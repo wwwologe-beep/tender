@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { Suspense, useEffect, useRef, useState } from 'react';
 import { useSearchParams } from 'next/navigation';
 
 // /admin/agents-live?secret=<ADMIN_LIVE_SECRET>
@@ -48,6 +48,14 @@ function timeLabel(iso: string): string {
 }
 
 export default function AgentsLivePage() {
+  return (
+    <Suspense fallback={null}>
+      <AgentsLiveInner />
+    </Suspense>
+  );
+}
+
+function AgentsLiveInner() {
   const secret = useSearchParams().get('secret') ?? '';
   const [rows, setRows] = useState<FeedRow[]>([]);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
