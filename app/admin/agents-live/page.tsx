@@ -23,28 +23,154 @@ interface FeedRow {
 
 const POLL_MS = 4000;
 
-function extractPromptResponse(row: FeedRow): { prompt: string | null; response: string | null } {
+// Human names for every tag this feed can show — the raw tag (e.g. "ai.analyzeOrder") is a
+// code identifier, not something a non-developer should have to decode.
+const AGENT_NAMES: Record<string, string> = {
+  'ai.analyzeOrder': 'Order Analyzer — разбирает заявку в структуру',
+  'ai.translateFaqEntry': 'FAQ Translator — переводит вопрос исполнителя',
+  'ai.translateFaqAnswer': 'Answer Translator — переводит ответ клиента',
+  'ai.translateChatMessage': 'Chat Translator — переводит сообщение в чате',
+  'ai.validateOrderCompleteness': 'Completeness Gatekeeper — проверяет полноту заявки (WhatsApp)',
+  'ai.generateWhatsAppGreeting': 'WhatsApp Greeter — приветствие для клиента',
+  'ai-advisor.chatWithAdvisor(role=driver)': 'Advisor — советует исполнителю',
+  'ai-advisor.chatWithAdvisor(role=client)': 'Advisor — советует клиенту',
+  'ai-advisor.rebuildOrderFaq': 'FAQ Rebuilder — обновляет описание заказа',
+  'orchestrator.buildVoiceCallInstructions': 'Голосовой агент — готовит промпт перед звонком',
+  'orchestrator.call-result': 'Голосовой агент — звонок завершён',
+  'orchestrator.create-order-from-call': 'Голосовой агент — создал заказ по входящему звонку',
+};
+
+function agentLabel(tag: string): string {
+  return AGENT_NAMES[tag] ?? tag;
+}
+
+type ParsedEvent =
+  | { kind: 'text-call'; prompt: string; response: string | null }
+  | { kind: 'voice-prompt'; prompt: string; candidate: string | null }
+  | { kind: 'voice-result'; outcome: string | null; transcript: Array<{ role: string; text: string }> | null }
+  | { kind: 'order-from-call'; description: string | null; phone: string | null; category: string | null }
+  | { kind: 'raw'; data: unknown };
+
+function parseEvent(row: FeedRow): ParsedEvent {
   const d = row.data as Record<string, unknown> | null;
-  if (!d) return { prompt: null, response: null };
+  if (!d) return { kind: 'raw', data: null };
 
-  // Text agents (lib/ai.ts, lib/ai-advisor.ts): { messages: [...], response: string }
-  if (Array.isArray(d.messages)) {
-    const sys = (d.messages as Array<{ role: string; content: string }>).find(m => m.role === 'system');
-    const user = (d.messages as Array<{ role: string; content: string }>).filter(m => m.role !== 'system');
-    const prompt = [sys?.content, ...user.map(m => `[${m.role}] ${m.content}`)].filter(Boolean).join('\n\n');
-    return { prompt, response: typeof d.response === 'string' ? d.response : null };
+  if (row.tag === 'orchestrator.call-result') {
+    const transcript = Array.isArray(d.transcript)
+      ? (d.transcript as Array<{ role: string; text: string }>)
+      : null;
+    return { kind: 'voice-result', outcome: typeof d.outcome === 'string' ? d.outcome : null, transcript };
   }
 
-  // Voice agents (lib/orchestrator/prompts.ts): { systemPrompt: string, candidateName, ... }
+  if (row.tag === 'orchestrator.create-order-from-call') {
+    return {
+      kind: 'order-from-call',
+      description: typeof d.description === 'string' ? d.description : null,
+      phone: typeof d.caller_phone === 'string' ? d.caller_phone : null,
+      category: typeof d.category === 'string' ? d.category : null,
+    };
+  }
+
+  // Voice call system-prompt build (before the call happens)
   if (typeof d.systemPrompt === 'string') {
-    return { prompt: d.systemPrompt, response: null };
+    return {
+      kind: 'voice-prompt',
+      prompt: d.systemPrompt,
+      candidate: typeof d.candidateName === 'string' ? d.candidateName : null,
+    };
   }
 
-  return { prompt: null, response: null };
+  // Text agents: { messages: [...], response: string }
+  if (Array.isArray(d.messages)) {
+    const msgs = d.messages as Array<{ role: string; content: string }>;
+    const sys = msgs.find(m => m.role === 'system');
+    const rest = msgs.filter(m => m.role !== 'system');
+    const prompt = [sys?.content, ...rest.map(m => `[${m.role}] ${m.content}`)].filter(Boolean).join('\n\n');
+    return { kind: 'text-call', prompt, response: typeof d.response === 'string' ? d.response : null };
+  }
+
+  return { kind: 'raw', data: d };
 }
 
 function timeLabel(iso: string): string {
   return new Date(iso).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
+const ROLE_LABEL: Record<string, string> = { ai: 'AI', user: 'Собеседник', system: 'Система' };
+
+function EventDetail({ row }: { row: FeedRow }) {
+  const parsed = parseEvent(row);
+
+  if (parsed.kind === 'text-call') {
+    return (
+      <>
+        <div>
+          <div style={styles.label}>Отправлено модели</div>
+          <pre style={styles.pre}>{parsed.prompt}</pre>
+        </div>
+        {parsed.response && (
+          <div>
+            <div style={styles.label}>Получено от модели</div>
+            <pre style={styles.pre}>{parsed.response}</pre>
+          </div>
+        )}
+      </>
+    );
+  }
+
+  if (parsed.kind === 'voice-prompt') {
+    return (
+      <div>
+        <div style={styles.label}>
+          Инструкция для голосового AI{parsed.candidate ? ` — звонок для «${parsed.candidate}»` : ''}
+        </div>
+        <pre style={styles.pre}>{parsed.prompt}</pre>
+      </div>
+    );
+  }
+
+  if (parsed.kind === 'voice-result') {
+    return (
+      <>
+        {parsed.outcome && (
+          <div>
+            <div style={styles.label}>Итог звонка</div>
+            <div style={{ fontSize: 13, color: '#e8ecf3' }}>{parsed.outcome}</div>
+          </div>
+        )}
+        {parsed.transcript && parsed.transcript.length > 0 && (
+          <div>
+            <div style={styles.label}>Разговор</div>
+            <div style={styles.transcript}>
+              {parsed.transcript.map((t, i) => (
+                <div key={i} style={styles.transcriptLine}>
+                  <span style={{ ...styles.transcriptRole, color: t.role === 'ai' ? '#5ec8ff' : '#f0a960' }}>
+                    {ROLE_LABEL[t.role] ?? t.role}
+                  </span>
+                  <span style={styles.transcriptText}>{t.text}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </>
+    );
+  }
+
+  if (parsed.kind === 'order-from-call') {
+    return (
+      <div>
+        <div style={styles.label}>Что создано из звонка</div>
+        <div style={{ fontSize: 13, color: '#e8ecf3', lineHeight: 1.6 }}>
+          {parsed.category && <div>Категория: {parsed.category}</div>}
+          {parsed.phone && <div>Телефон: {parsed.phone}</div>}
+          {parsed.description && <div>Описание: {parsed.description}</div>}
+        </div>
+      </div>
+    );
+  }
+
+  return <pre style={styles.pre}>{JSON.stringify(parsed.data, null, 2)}</pre>;
 }
 
 export default function AgentsLivePage() {
@@ -122,9 +248,7 @@ function AgentsLiveInner() {
   if (status === 'unauthorized') {
     return (
       <div style={styles.centerScreen}>
-        <p style={{ color: '#97a3b8', fontFamily: MONO }}>
-          Нужен ?secret=... в адресе страницы.
-        </p>
+        <p style={{ color: '#97a3b8', fontFamily: MONO }}>Нужен ?secret=... в адресе страницы.</p>
       </div>
     );
   }
@@ -154,34 +278,18 @@ function AgentsLiveInner() {
           </p>
         )}
         {rows.map(row => {
-          const { prompt, response } = extractPromptResponse(row);
           const isOpen = expanded.has(row.id);
           const isVoice = row.source === 'voice-call';
           return (
             <div key={row.id} style={{ ...styles.card, borderColor: isVoice ? 'rgba(240,169,96,0.4)' : '#262e3d' }}>
               <div style={styles.cardHead} onClick={() => toggle(row.id)}>
                 <span style={styles.time}>{timeLabel(row.created_at)}</span>
-                <span style={{ ...styles.tag, color: isVoice ? '#f0a960' : '#5ec8ff' }}>{row.tag}</span>
-                <span style={styles.msgPreview}>{row.message.slice(0, 90)}</span>
+                <span style={{ ...styles.tag, color: isVoice ? '#f0a960' : '#5ec8ff' }}>{agentLabel(row.tag)}</span>
                 <span style={styles.chev}>{isOpen ? '▾' : '▸'}</span>
               </div>
               {isOpen && (
                 <div style={styles.cardBody}>
-                  {prompt && (
-                    <div>
-                      <div style={styles.label}>отправлено модели</div>
-                      <pre style={styles.pre}>{prompt}</pre>
-                    </div>
-                  )}
-                  {response && (
-                    <div>
-                      <div style={styles.label}>получено от модели</div>
-                      <pre style={styles.pre}>{response}</pre>
-                    </div>
-                  )}
-                  {!prompt && !response && (
-                    <pre style={styles.pre}>{JSON.stringify(row.data, null, 2)}</pre>
-                  )}
+                  <EventDetail row={row} />
                 </div>
               )}
             </div>
@@ -198,21 +306,24 @@ const MONO = "'SF Mono', 'JetBrains Mono', Consolas, monospace";
 const styles: Record<string, React.CSSProperties> = {
   page: { minHeight: '100vh', background: '#0e1117', color: '#e8ecf3', fontFamily: '-apple-system, sans-serif', display: 'flex', flexDirection: 'column' },
   header: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '18px 24px', borderBottom: '1px solid #1d2431', flexShrink: 0 },
-  eyebrow: { fontFamily: "'SF Mono', monospace", fontSize: 11, letterSpacing: '0.1em', textTransform: 'uppercase', color: '#5c6884', marginBottom: 4 },
+  eyebrow: { fontFamily: MONO, fontSize: 11, letterSpacing: '0.1em', textTransform: 'uppercase', color: '#5c6884', marginBottom: 4 },
   h1: { fontSize: 18, fontWeight: 650, margin: 0 },
   headerRight: { display: 'flex', alignItems: 'center', gap: 10 },
   statusDot: { width: 8, height: 8, borderRadius: '50%' },
-  statusText: { fontFamily: "'SF Mono', monospace", fontSize: 11.5, color: '#97a3b8' },
-  pauseBtn: { fontFamily: "'SF Mono', monospace", fontSize: 11.5, color: '#97a3b8', background: '#171d28', border: '1px solid #262e3d', borderRadius: 6, padding: '5px 10px', cursor: 'pointer', marginLeft: 8 },
+  statusText: { fontFamily: MONO, fontSize: 11.5, color: '#97a3b8' },
+  pauseBtn: { fontFamily: MONO, fontSize: 11.5, color: '#97a3b8', background: '#171d28', border: '1px solid #262e3d', borderRadius: 6, padding: '5px 10px', cursor: 'pointer', marginLeft: 8 },
   feed: { flex: 1, overflowY: 'auto', padding: '18px 24px', display: 'flex', flexDirection: 'column', gap: 8 },
   card: { background: '#171d28', border: '1px solid #262e3d', borderRadius: 9, overflow: 'hidden' },
-  cardHead: { display: 'flex', alignItems: 'center', gap: 10, padding: '9px 13px', cursor: 'pointer' },
-  time: { fontFamily: "'SF Mono', monospace", fontSize: 11, color: '#5c6884', flexShrink: 0 },
-  tag: { fontFamily: "'SF Mono', monospace", fontSize: 11.5, fontWeight: 600, flexShrink: 0 },
-  msgPreview: { fontSize: 12.5, color: '#97a3b8', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+  cardHead: { display: 'flex', alignItems: 'center', gap: 12, padding: '10px 13px', cursor: 'pointer' },
+  time: { fontFamily: MONO, fontSize: 11, color: '#5c6884', flexShrink: 0 },
+  tag: { fontSize: 13, fontWeight: 600, flex: 1 },
   chev: { color: '#5c6884', flexShrink: 0 },
   cardBody: { padding: '0 13px 13px', display: 'flex', flexDirection: 'column', gap: 10 },
-  label: { fontFamily: "'SF Mono', monospace", fontSize: 9.5, letterSpacing: '0.08em', textTransform: 'uppercase', color: '#5c6884', marginBottom: 5 },
-  pre: { fontFamily: "'SF Mono', monospace", fontSize: 11.5, lineHeight: 1.6, color: '#c3cbdb', background: '#10141c', border: '1px solid #1d2431', borderRadius: 7, padding: '10px 12px', whiteSpace: 'pre-wrap', margin: 0, maxHeight: 300, overflowY: 'auto' },
+  label: { fontFamily: MONO, fontSize: 9.5, letterSpacing: '0.08em', textTransform: 'uppercase', color: '#5c6884', marginBottom: 5 },
+  pre: { fontFamily: MONO, fontSize: 11.5, lineHeight: 1.6, color: '#c3cbdb', background: '#10141c', border: '1px solid #1d2431', borderRadius: 7, padding: '10px 12px', whiteSpace: 'pre-wrap', margin: 0, maxHeight: 300, overflowY: 'auto' },
+  transcript: { background: '#10141c', border: '1px solid #1d2431', borderRadius: 7, padding: '10px 12px', maxHeight: 320, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 8 },
+  transcriptLine: { fontSize: 13, lineHeight: 1.5 },
+  transcriptRole: { fontFamily: MONO, fontSize: 10.5, fontWeight: 700, marginRight: 8 },
+  transcriptText: { color: '#e8ecf3' },
   centerScreen: { minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#0e1117' },
 };

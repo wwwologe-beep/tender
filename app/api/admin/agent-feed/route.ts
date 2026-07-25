@@ -20,6 +20,10 @@ export async function GET(req: NextRequest) {
     .from('system_logs')
     .select('id, created_at, source, tag, level, order_id, message, data')
     .in('source', ['ai-agent', 'voice-call'])
+    // simulate-voice-call.ts writes source:'voice-call' too (same tag namespace as real
+    // calls, since it exercises the exact same prompt-building code) — exclude it here so
+    // this live view only ever shows real production agent activity, not test runs.
+    .neq('tag', 'simulate-voice-call')
     .order('created_at', { ascending: true })
     .limit(50);
 
