@@ -16,20 +16,22 @@ export async function GET(req: NextRequest) {
 
   const since = req.nextUrl.searchParams.get('since');
 
-  let query = supabaseAdmin
-    .from('system_logs')
-    .select('id, created_at, source, tag, level, order_id, message, data')
-    .in('source', ['ai-agent', 'voice-call'])
-    // simulate-voice-call.ts writes source:'voice-call' too (same tag namespace as real
-    // calls, since it exercises the exact same prompt-building code) — exclude it here so
-    // this live view only ever shows real production agent activity, not test runs.
-    .neq('tag', 'simulate-voice-call')
-    .order('created_at', { ascending: true })
-    .limit(50);
+  function baseQuery() {
+    return supabaseAdmin
+      .from('system_logs')
+      .select('id, created_at, source, tag, level, order_id, message, data')
+      .in('source', ['ai-agent', 'voice-call'])
+      // simulate-voice-call.ts writes source:'voice-call' with the exact same tags as real
+      // calls (it calls buildVoiceCallInstructions() directly to test the real prompt) — the
+      // tag alone can't tell a test run apart from production. It always passes this fixed
+      // placeholder name, though, so filter on that instead of the tag.
+      .not('message', 'ilike', '%Симулированный исполнитель%')
+      .neq('tag', 'simulate-voice-call');
+  }
 
-  query = since ? query.gt('created_at', since) : query.order('created_at', { ascending: false }).limit(20);
-
-  const { data, error } = await query;
+  const { data, error } = since
+    ? await baseQuery().gt('created_at', since).order('created_at', { ascending: true }).limit(50)
+    : await baseQuery().order('created_at', { ascending: false }).limit(20);
 
   if (error) {
     return NextResponse.json({ error: error.message }, { status: 500 });
